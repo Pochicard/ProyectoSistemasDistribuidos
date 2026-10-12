@@ -11,14 +11,8 @@ public class BaseDatos {
     }
 
     private void cargarEventosIniciales() {
-        for (int i = 1; i <= 20; i++) {
-            String id = "E" + i;
-            eventos.put(id, new Evento(id, 2, "2026-11-10", "2026-11-20"));
-        }
-        for (int i = 21; i <= 50; i++) {
-            String id = "E" + i;
-            eventos.put(id, new Evento(id, 1, "2026-11-15", null));
-        }
+        eventos.put("E1", new Evento("E1", 1, "2026-11-10", "2026-11-20"));
+        eventos.put("E2", new Evento("E2", 1, "2026-11-15", "2026-11-25"));
     }
 
     public Map<String, Evento> getEventos() {
