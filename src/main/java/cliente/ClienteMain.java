@@ -311,7 +311,7 @@ public class ClienteMain {
     /** @return id válido, o null si el usuario deja la línea vacía para cancelar */
     private String pedirIdEvento(Map<String, EventoDto> eventos) {
         while (true) {
-            String texto = leer("Identificador del evento (ej. E7, vacío para cancelar): ");
+            String texto = leer("Identificador del evento (ej. E2, vacío para cancelar): ");
             if (texto.isBlank()) {
                 return null;
             }
