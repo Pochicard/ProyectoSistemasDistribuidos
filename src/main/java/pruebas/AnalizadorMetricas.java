@@ -13,24 +13,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 
-/**
- * Cálculo de métricas de rendimiento a partir de un CSV de resultados.
- *
- * <p>El generador usa esta misma clase para su resumen, de modo que el CSV es la única fuente de datos.</p>
- *
- * <p>Definiciones, por operación (CONSULTA, RESERVA) y en total:</p>
- * <ul>
- *   <li>Enviadas: todas las solicitudes registradas.</li>
- *   <li>Respondidas (procesadas): OK + RECHAZADO.</li>
- *   <li>Errores técnicos: NO_ENVIADO + SIN_RESPUESTA + RESPUESTA_INVALIDA; se excluyen de tiempos y TPM.</li>
- *   <li>Tiempo promedio y desviación estándar muestral (n − 1): calculados sobre las respondidas.</li>
- *   <li>TPM: respondidas por minuto de la ventana de medición.</li>
- *   <li>Ventana: duración de la prueba menos los segundos descartados. Si no se indica la duración,
- *       se toma desde el primer envío hasta la última respuesta.</li>
- * </ul>
- *
- * <p>Uso: {@code pruebas.AnalizadorMetricas <archivo.csv> --duracion=150 [--descartar=10]}</p>
- */
+
 public final class AnalizadorMetricas {
 
     /** Métricas de un tipo de operación o del total. */
@@ -44,7 +27,6 @@ public final class AnalizadorMetricas {
         }
     }
 
-    /** Resultado completo del análisis de un CSV. */
     public record Resultado(Estadistica consulta, Estadistica reserva, Estadistica total,
                             Instant inicioVentana, Instant finVentana, double ventanaSeg,
                             int registrosTotales, int registrosDescartados) {
@@ -78,12 +60,7 @@ public final class AnalizadorMetricas {
         return registros;
     }
 
-    /**
-     * Calcula las métricas de los registros.
-     *
-     * @param descartarSeg segundos iniciales excluidos (calentamiento); 0 para usar todos
-     * @param duracionSeg  duración de la prueba; si es 0 o menor, la ventana se deduce de los timestamps
-     */
+
     public static Resultado analizar(List<RegistroTransaccion> todos, int descartarSeg, double duracionSeg) {
         if (todos.isEmpty()) {
             Estadistica vacia = calcular("-", List.of(), 0);

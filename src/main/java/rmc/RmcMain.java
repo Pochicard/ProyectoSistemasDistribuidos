@@ -1,50 +1,63 @@
 package rmc;
 
+import comun.Argumentos;
 import org.zeromq.SocketType;
 import org.zeromq.ZContext;
 import org.zeromq.ZMQ;
 
+/**
+ * Servicio RMC (Reserva, Modificación y Consulta). Capa de negocio, MÁQUINA 2.
+ *
+ * <p>Patrón: <b>Request/Reply síncrono</b> en los dos lados.</p>
+ * <ul>
+ *   <li>Hacia el GT: socket REP (recibe una solicitud, responde, recibe la siguiente).</li>
+ *   <li>Hacia Persistencia: socket REQ. Tras enviar queda <i>bloqueado</i> en recv() hasta
+ *       que la Persistencia confirma; solo entonces responde al GT.</li>
+ * </ul>
+ *
+ * <pre>
+ * Uso: java -cp srb.jar rmc.RmcMain [--puerto=5556] [--persistencia=host:5557]
+ * </pre>
+ */
 public class RmcMain {
-    private static final String PERSISTENCIA_HOST = "localhost";
-    private static final int PERSISTENCIA_PUERTO = 5557;
-
-    private static final int RMC_PUERTO_ESCUCHA = 5556;
 
     public static void main(String[] args) {
+        Argumentos a = new Argumentos(args);
+        int puerto = a.entero("puerto", 5556);
+        String persistencia = a.endpoint("persistencia", "localhost:5557");
+
         try (ZContext context = new ZContext()) {
             ZMQ.Socket socketGt = context.createSocket(SocketType.REP);
-            socketGt.bind("tcp://*:" + RMC_PUERTO_ESCUCHA);
+            socketGt.bind("tcp://*:" + puerto);
 
             ZMQ.Socket socketPersistencia = context.createSocket(SocketType.REQ);
-            socketPersistencia.connect("tcp://" + PERSISTENCIA_HOST + ":" + PERSISTENCIA_PUERTO);
+            socketPersistencia.connect(persistencia);
 
             System.out.println("==========================================");
-            System.out.println("[Servicio RMC] Escuchando al GT en el puerto " + RMC_PUERTO_ESCUCHA + "...");
-            System.out.println("[Servicio RMC] Conectado a Persistencia en " + PERSISTENCIA_HOST + ":" + PERSISTENCIA_PUERTO);
+            System.out.println("[RMC] Escuchando al GT en tcp://*:" + puerto);
+            System.out.println("[RMC] Conectado a Persistencia en " + persistencia);
             System.out.println("==========================================");
 
             while (!Thread.currentThread().isInterrupted()) {
-                byte[] request = socketGt.recv(0);
-                String mensajeGt = new String(request, ZMQ.CHARSET);
-                System.out.println("[Servicio RMC] Petición recibida del GT: " + mensajeGt);
+                String mensajeGt = new String(socketGt.recv(0), ZMQ.CHARSET);
+                System.out.println("[RMC] Recibido del GT: " + mensajeGt);
 
-                String respuestaPersistencia = "";
-
-                if (mensajeGt.startsWith("CONSULTA")) {socketPersistencia.send(mensajeGt.getBytes(ZMQ.CHARSET), 0);
-                    byte[] reply = socketPersistencia.recv(0);
-                    respuestaPersistencia = new String(reply, ZMQ.CHARSET);
-
-                } else if (mensajeGt.startsWith("RESERVA")) {
+                String respuesta;
+                if (mensajeGt.startsWith("CONSULTA") || mensajeGt.startsWith("RESERVA")) {
                     socketPersistencia.send(mensajeGt.getBytes(ZMQ.CHARSET), 0);
-                    byte[] reply = socketPersistencia.recv(0);
-                    respuestaPersistencia = new String(reply, ZMQ.CHARSET);
-
+                    respuesta = new String(socketPersistencia.recv(0), ZMQ.CHARSET); // espera síncrona
                 } else {
-                    respuestaPersistencia = "ERROR: Operación no soportada por el Servicio RMC";
+                    respuesta = "ERROR: Operación no soportada por el RMC";
                 }
-                socketGt.send(respuestaPersistencia.getBytes(ZMQ.CHARSET), 0);
-                System.out.println("[Servicio RMC] Respuesta enviada al GT: " + (respuestaPersistencia.length() > 60 ? "JSON con datos" : respuestaPersistencia));
+
+                socketGt.send(respuesta.getBytes(ZMQ.CHARSET), 0);
+                System.out.println("[RMC] Respuesta al GT: "
+                        + (respuesta.length() > 60 ? "JSON con " + contarEventos(respuesta) + " eventos" : respuesta));
             }
         }
+    }
+
+    private static int contarEventos(String json) {
+        return json.split("\"id\"", -1).length - 1;
     }
 }

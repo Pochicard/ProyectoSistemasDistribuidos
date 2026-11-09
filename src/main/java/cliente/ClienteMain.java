@@ -6,17 +6,6 @@ import java.io.InputStreamReader;
 import java.io.UncheckedIOException;
 import java.util.Map;
 
-/**
- * Cliente interactivo de consola del Sistema de Reserva de Boletos (SRB).
- *
- * <p>Se comunica únicamente con el Gestor de Transacciones mediante ZeroMQ REQ/REP,
- * respetando el protocolo de texto existente (ver {@link ProtocoloSrb}).</p>
- *
- * <pre>
- * Uso:   java -cp &lt;classpath&gt; cliente.ClienteMain [--gt=host:puerto] [--timeout=ms] [--reintentos=n]
- * Valores por defecto:  --gt=localhost:5555  --timeout=5000  --reintentos=2
- * </pre>
- */
 public class ClienteMain {
 
     private static final String HOST_DEFECTO = "localhost";
@@ -28,7 +17,6 @@ public class ClienteMain {
     private final BufferedReader entrada;
     private final int reintentosConsulta;
 
-    /** Se lanza cuando la entrada estándar se cierra (Ctrl+D / Ctrl+Z o fin de un archivo redirigido). */
     private static class FinDeEntrada extends RuntimeException {
         private static final long serialVersionUID = 1L;
 
@@ -42,8 +30,6 @@ public class ClienteMain {
         this.entrada = entrada;
         this.reintentosConsulta = reintentosConsulta;
     }
-
-    // ------------------------------------------------------------------ arranque
 
     public static void main(String[] args) {
         String host = HOST_DEFECTO;
@@ -105,8 +91,6 @@ public class ClienteMain {
         System.out.println("  --reintentos  reintentos automáticos SOLO para CONSULTA (defecto 2)");
     }
 
-    // ------------------------------------------------------------------ menú
-
     void ejecutar() {
         System.out.println("==========================================");
         System.out.println("[Cliente SRB] Gestor de Transacciones: " + conexion.getEndpoint());
@@ -145,16 +129,12 @@ public class ClienteMain {
         }
     }
 
-    // ------------------------------------------------------------------ opción 1
-
     private void opcionConsultar() {
         Map<String, EventoDto> eventos = consultarConReintentos();
         if (eventos != null) {
             imprimirTabla(eventos);
         }
     }
-
-    // ------------------------------------------------------------------ opción 3
 
     private void opcionVerEvento() {
         Map<String, EventoDto> eventos = consultarConReintentos();

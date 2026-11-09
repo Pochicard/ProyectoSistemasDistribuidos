@@ -40,3 +40,5 @@ build/
 
 ### Resultados de pruebas ###
 resultados/
+### Datos persistentes de la BD (se generan al ejecutar) ###
+datos/
