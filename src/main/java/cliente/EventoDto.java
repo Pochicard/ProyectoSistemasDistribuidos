@@ -1,20 +1,9 @@
 package cliente;
 
 /**
- * Copia en el cliente de un evento tal como lo serializa la Persistencia con Gson.
- *
- * <p>Los nombres de los atributos deben coincidir EXACTAMENTE con los de
- * {@code persistencia.Evento}, porque Gson los asocia por nombre. Ejemplo real de la respuesta:</p>
- * <pre>
- * "E1":  {"id":"E1","ocurrencias":2,"fecha1":"2026-11-10","fecha2":"2026-11-20",
- *         "asientosDisponibles1":100,"asientosDisponibles2":100}
- * "E21": {"id":"E21","ocurrencias":1,"fecha1":"2026-11-15",
- *         "asientosDisponibles1":100,"asientosDisponibles2":0}
- * </pre>
- * <p>Gson omite los valores null, por eso los eventos de una ocurrencia no traen {@code fecha2}.</p>
- *
- * <p>Se usa una clase propia del cliente (y no {@code persistencia.Evento}) para que el
- * cliente no dependa del código interno del servidor: solo del contrato JSON.</p>
+ * Evento recibido en el JSON de CONSULTA. Los atributos tienen los mismos nombres que en
+ * {@code persistencia.Evento} porque Gson los asocia por nombre; Gson omite {@code fecha2} en los eventos
+ * de una sola ocurrencia.
  */
 public class EventoDto {
 
@@ -33,7 +22,6 @@ public class EventoDto {
         return ocurrencias;
     }
 
-    /** @return true si la ocurrencia está entre 1 y el número de ocurrencias del evento */
     public boolean esOcurrenciaValida(int ocurrencia) {
         return ocurrencia >= 1 && ocurrencia <= ocurrencias;
     }

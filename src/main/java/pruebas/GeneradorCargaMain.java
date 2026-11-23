@@ -8,15 +8,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Punto de entrada del generador de carga.
- *
- * <pre>
- * java -cp "target/classes;target/dependency/*" pruebas.GeneradorCargaMain --escenario=A
- * java -cp "target/classes;target/dependency/*" pruebas.GeneradorCargaMain --escenario=C --duracion=150 --rpm=30
- * </pre>
- *
- * <p>Sin argumentos muestra un menú de escenarios. Ctrl+C detiene la prueba de forma ordenada: se cierran
- * sockets y archivos y el resumen se marca como INTERRUMPIDA.</p>
+ * Punto de entrada del generador de carga. Sin argumentos muestra un menú de escenarios; con
+ * {@code --ayuda} lista los parámetros. Ctrl+C detiene la prueba de forma ordenada y guarda los resultados.
  */
 public class GeneradorCargaMain {
 
@@ -61,8 +54,8 @@ public class GeneradorCargaMain {
             GeneradorCarga.ResultadoEjecucion r = new GeneradorCarga(System.out).ejecutar(cfg, detener);
             System.out.println("Resumen guardado en: " + r.resumen().toAbsolutePath());
             System.out.println("Acumulado de todas las pruebas: "
-                    + cfg.getCarpetaSalida().resolve("resumen-escenarios_excel.csv").toAbsolutePath());
-            System.out.println("Recuerde reiniciar Persistencia antes de la siguiente prueba independiente.");
+                    + cfg.getCarpetaSalida().resolve(GeneradorCarga.ACUMULADO).toAbsolutePath());
+            System.out.println("Antes de la siguiente prueba independiente, arranque Persistencia con --reiniciar.");
         } catch (IllegalStateException | IllegalArgumentException e) {
             System.out.println("[Generador] No se pudo ejecutar la prueba: " + e.getMessage());
             codigo = 1;
@@ -133,9 +126,14 @@ public class GeneradorCargaMain {
         System.out.println("  --duracion=150          segundos");
         System.out.println("  --rpm=30                solicitudes por minuto por cliente (mínimo 20)");
         System.out.println("  --pct-reserva=50        % de reservas de los clientes mixtos");
+        System.out.println("  --pct-modificacion=20   % de modificaciones de los mixtos (B y C: 20; A: 0)");
+        System.out.println("  --pct-cancelacion=0     % de cancelaciones de los mixtos (el resto son consultas)");
+        System.out.println("  --protocolo=v2          v2 con idSol; v1 = formato de la primera entrega");
         System.out.println("  --asientos=1-2          asientos por reserva (fijo o rango)");
         System.out.println("  --seleccion=aleatoria   aleatoria | rotacion | fija (con --evento=E1 --ocurrencia=1)");
-        System.out.println("  --gt=localhost:5555     dirección del Gestor de Transacciones");
+        System.out.println("  --gt=localhost:5555     GT o lista primario,respaldo (ej. 192.168.56.101:5555,192.168.56.101:5565)");
+        System.out.println("  --ip=127.0.0.1          IP de este equipo para las notificaciones de cancelación");
+        System.out.println("  --puerto-notif=6100     puerto local de las notificaciones");
         System.out.println("  --timeout=5000          espera máxima por respuesta (ms)");
         System.out.println("  --salida=resultados     carpeta de resultados");
         System.out.println("  --semilla=42            semilla de aleatoriedad");

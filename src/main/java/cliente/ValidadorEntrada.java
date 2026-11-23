@@ -5,12 +5,10 @@ import java.util.Map;
 import java.util.regex.Pattern;
 
 /**
- * Validaciones que hace el CLIENTE antes de enviar una solicitud.
+ * Validaciones que realiza el cliente antes de enviar una solicitud.
  *
- * <p>Importante para la sustentación: estas validaciones protegen al sistema de errores del
- * usuario de ESTE cliente, pero no son una garantía del sistema. El servidor actual no valida
- * la cantidad (acepta 0 y negativos) y se cae con mensajes mal formados, así que otro cliente
- * podría seguir provocando esos problemas. Ver el reporte de defectos del backend.</p>
+ * <p>Evitan enviar solicitudes que con seguridad serían rechazadas. No reemplazan las validaciones
+ * del servidor, que vuelve a comprobar cantidades, ocurrencias y reservas.</p>
  *
  * <p>Cada método lanza {@link IllegalArgumentException} con un mensaje listo para mostrar.</p>
  */
@@ -56,6 +54,21 @@ public final class ValidadorEntrada {
             throw new IllegalArgumentException("La cantidad de asientos debe ser mayor que cero.");
         }
         return cantidad;
+    }
+
+    /** Valida que el identificador de reserva sea un entero positivo. */
+    public static long validarIdReserva(String entrada) {
+        String texto = entrada == null ? "" : entrada.trim();
+        long id;
+        try {
+            id = Long.parseLong(texto);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("El número de reserva debe ser un entero: \"" + texto + "\".");
+        }
+        if (id <= 0) {
+            throw new IllegalArgumentException("El número de reserva debe ser mayor que cero.");
+        }
+        return id;
     }
 
     private static int parsearEntero(String entrada, String campo) {

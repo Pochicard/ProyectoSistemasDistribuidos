@@ -11,21 +11,16 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Escritura concurrente de los CSV mediante el patrón productor-consumidor.
- *
- * <p>Los clientes simulados solo agregan registros a una cola concurrente; un único hilo escritor los
- * vuelca a disco. De esta forma las filas no se mezclan y la escritura en disco no afecta la latencia
- * medida por los clientes.</p>
- *
- * <p>Al cerrar se encola el marcador {@link #FIN}; el hilo escritor procesa los registros pendientes
- * antes de terminar, por lo que no se pierde ninguno.</p>
+ * Escritura de los CSV con el patrón productor-consumidor: los clientes encolan registros y un único hilo
+ * los escribe, así las filas no se mezclan y el disco no afecta la latencia medida. Al cerrar se encola el
+ * marcador {@link #FIN} para escribir lo pendiente antes de terminar.
  */
 public final class EscritorCsv {
 
     /** Marcador de fin de escritura. Se compara por referencia y nunca se escribe. */
     private static final RegistroTransaccion FIN = new RegistroTransaccion(
             -1, Instant.EPOCH, "", PerfilCliente.SOLO_CONSULTA, TipoOperacion.CONSULTA,
-            0, EstadoTransaccion.OK, null, null, null);
+            0, EstadoTransaccion.OK, null, null, null, null);
 
     private final BlockingQueue<RegistroTransaccion> cola = new LinkedBlockingQueue<>();
     private final BufferedWriter csv;
@@ -35,10 +30,7 @@ public final class EscritorCsv {
     private volatile IOException error;
     private volatile boolean cerrado;
 
-    /**
-     * @param rutaCsv      CSV estándar (separador ',')
-     * @param rutaCsvExcel CSV para Excel en español (separador ';', coma decimal); puede ser null
-     */
+    // rutaCsvExcel (opcional) usa ';' y coma decimal para abrirlo en Excel en español.
     public EscritorCsv(Path rutaCsv, Path rutaCsvExcel) throws IOException {
         this.csv = Files.newBufferedWriter(rutaCsv, StandardCharsets.UTF_8);
         this.csv.write(RegistroTransaccion.ENCABEZADO);

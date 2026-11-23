@@ -1,30 +1,15 @@
 package pruebas;
 
+import cliente.ConexionGt;
+
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.List;
 import java.util.Locale;
 
 /**
- * Parámetros de una prueba de carga, configurables por línea de comandos.
- *
- * <pre>
- * --escenario=A|B|C        A: 3 clientes (2 solo consulta + 1 mixto)
- *                          B: 5 clientes (3 solo consulta + 2 mixtos)
- *                          C: 8 clientes (4 solo consulta + 4 mixtos)
- * --clientes=N             escenario personalizado: número de clientes
- * --solo-consulta=K        escenario personalizado: clientes que solo consultan
- * --duracion=150           duración en segundos
- * --rpm=30                 solicitudes por minuto de cada cliente (mínimo 20)
- * --pct-reserva=50         porcentaje de reservas de los clientes mixtos
- * --asientos=1-2           asientos por reserva: valor fijo o rango
- * --seleccion=aleatoria    aleatoria | rotacion | fija
- * --evento=E1 --ocurrencia=1   destino cuando --seleccion=fija
- * --gt=localhost:5555      dirección del Gestor de Transacciones
- * --timeout=5000           tiempo límite por solicitud (ms)
- * --salida=resultados      carpeta de resultados
- * --semilla=42             semilla para la generación aleatoria (permite repetir la secuencia)
- * --descartar=0            segundos iniciales excluidos de las métricas
- * </pre>
+ * Parámetros de una prueba de carga y escenarios A, B y C del enunciado. La lista completa de parámetros
+ * se muestra con {@code pruebas.GeneradorCargaMain --ayuda}.
  */
 public final class ConfiguracionCarga {
 
@@ -36,13 +21,18 @@ public final class ConfiguracionCarga {
     int duracionSeg = 150;
     int rpm = 30;
     int pctReserva = 50;
+    int pctModificacion = 0;
+    int pctCancelacion = 0;
+    String protocolo = "v2";
     int asientosMin = 1;
     int asientosMax = 2;
     SelectorOcurrencia.Estrategia seleccion = SelectorOcurrencia.Estrategia.ALEATORIA;
     String eventoFijo = "E1";
     int ocurrenciaFija = 1;
-    String host = "localhost";
-    int puerto = 5555;
+    List<String> gts = List.of("localhost:5555");
+    String ip = "127.0.0.1";
+    int puertoNotif = 6100;
+    int esperaNotificacionesSeg = 5;
     int timeoutMs = 5000;
     Path carpetaSalida = Paths.get("resultados");
     long semilla = 42;
@@ -66,11 +56,13 @@ public final class ConfiguracionCarga {
                 nombre = "B";
                 clientes = 5;
                 soloConsulta = 3;
+                pctModificacion = 20; // el enunciado pide reserva y modificación en B y C
                 break;
             case "C":
                 nombre = "C";
                 clientes = 8;
                 soloConsulta = 4;
+                pctModificacion = 20;
                 break;
             default:
                 throw new IllegalArgumentException("Escenario desconocido: " + letra + " (use A, B o C)");
@@ -109,6 +101,21 @@ public final class ConfiguracionCarga {
                 case "pct-reserva":
                     c.pctReserva = entero(valor, clave);
                     break;
+                case "pct-modificacion":
+                    c.pctModificacion = entero(valor, clave);
+                    break;
+                case "pct-cancelacion":
+                    c.pctCancelacion = entero(valor, clave);
+                    break;
+                case "protocolo":
+                    c.protocolo = valor.toLowerCase(Locale.ROOT);
+                    break;
+                case "ip":
+                    c.ip = valor;
+                    break;
+                case "puerto-notif":
+                    c.puertoNotif = entero(valor, clave);
+                    break;
                 case "asientos":
                     int guion = valor.indexOf('-');
                     if (guion > 0) {
@@ -133,12 +140,7 @@ public final class ConfiguracionCarga {
                     c.ocurrenciaFija = entero(valor, clave);
                     break;
                 case "gt":
-                    int dosPuntos = valor.lastIndexOf(':');
-                    if (dosPuntos <= 0) {
-                        throw new IllegalArgumentException("Use --gt=host:puerto, por ejemplo --gt=localhost:5555");
-                    }
-                    c.host = valor.substring(0, dosPuntos);
-                    c.puerto = entero(valor.substring(dosPuntos + 1), clave);
+                    c.gts = ConexionGt.parsearDirecciones(valor);
                     break;
                 case "timeout":
                     c.timeoutMs = entero(valor, clave);
@@ -173,10 +175,16 @@ public final class ConfiguracionCarga {
         exigir(soloConsulta >= 0 && soloConsulta <= clientes, "--solo-consulta debe estar entre 0 y el número de clientes");
         exigir(duracionSeg >= 5 && duracionSeg <= 3600, "--duracion debe estar entre 5 y 3600 segundos");
         exigir(rpm >= RPM_MINIMO && rpm <= 6000, "--rpm debe estar entre " + RPM_MINIMO + " (mínimo del enunciado) y 6000");
-        exigir(pctReserva >= 0 && pctReserva <= 100, "--pct-reserva debe estar entre 0 y 100");
+        exigir(pctReserva >= 0 && pctModificacion >= 0 && pctCancelacion >= 0
+                && pctReserva + pctModificacion + pctCancelacion <= 100,
+                "los porcentajes de reserva, modificación y cancelación deben sumar entre 0 y 100");
+        exigir(protocolo.equals("v1") || protocolo.equals("v2"), "--protocolo debe ser v1 o v2");
+        exigir(usaIdSol() || (pctModificacion == 0 && pctCancelacion == 0),
+                "con --protocolo=v1 no hay modificaciones ni cancelaciones (use --pct-modificacion=0)");
+        exigir(!ip.isEmpty() && !ip.contains(":"), "--ip debe ser una dirección IPv4 o un nombre de equipo");
+        exigir(puertoNotif >= 1 && puertoNotif <= 65535, "--puerto-notif debe estar entre 1 y 65535");
         exigir(asientosMin >= 1 && asientosMax >= asientosMin, "--asientos debe ser positivo (ej. 2 o 1-2)");
         exigir(timeoutMs >= 100 && timeoutMs <= 600_000, "--timeout debe estar entre 100 y 600000 ms");
-        exigir(puerto >= 1 && puerto <= 65535, "el puerto del GT debe estar entre 1 y 65535");
         exigir(descartarSeg >= 0 && descartarSeg < duracionSeg, "--descartar debe ser menor que la duración");
         exigir(ocurrenciaFija >= 1, "--ocurrencia debe ser positiva");
     }
@@ -193,6 +201,11 @@ public final class ConfiguracionCarga {
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException("--" + clave + " debe ser un número entero: " + texto);
         }
+    }
+
+    /** v2 envía idSol en cada mensaje y recibe el número de reserva. */
+    public boolean usaIdSol() {
+        return protocolo.equals("v2");
     }
 
     public int clientesMixtos() {
@@ -212,13 +225,15 @@ public final class ConfiguracionCarga {
     public String descripcion() {
         return String.format(Locale.ROOT,
                 "Escenario %s | %d clientes (%d solo consulta, %d mixto(s)) | %d s | %d solicitudes/min por cliente%n"
-                        + "Reservas: %d%% de las solicitudes de los clientes mixtos, %s asiento(s), selección %s%s%n"
-                        + "GT: tcp://%s:%d | tiempo límite %d ms | semilla %d | descartar primeros %d s",
+                        + "Clientes mixtos: %d%% reservas, %d%% modificaciones, %d%% cancelaciones, %d%% consultas;"
+                        + " %s asiento(s), selección %s%s%n"
+                        + "GT: %s | protocolo %s | tiempo límite %d ms | semilla %d | descartar primeros %d s",
                 nombre, clientes, soloConsulta, clientesMixtos(), duracionSeg, rpm,
-                pctReserva, asientosMin == asientosMax ? Integer.toString(asientosMin) : asientosMin + "-" + asientosMax,
+                pctReserva, pctModificacion, pctCancelacion, 100 - pctReserva - pctModificacion - pctCancelacion,
+                asientosMin == asientosMax ? Integer.toString(asientosMin) : asientosMin + "-" + asientosMax,
                 seleccion.name().toLowerCase(Locale.ROOT),
                 seleccion == SelectorOcurrencia.Estrategia.FIJA ? " (" + eventoFijo + ":" + ocurrenciaFija + ")" : "",
-                host, puerto, timeoutMs, semilla, descartarSeg);
+                String.join(",", gts), protocolo, timeoutMs, semilla, descartarSeg);
     }
 
     public String getNombre() { return nombre; }
