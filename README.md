@@ -78,9 +78,14 @@ java -cp srb.jar gt.GtMain --rol=primario --puerto=5555 --rmc=localhost:5556,loc
 java -cp srb.jar gt.GtMain --rol=respaldo --puerto=5565 --rmc=localhost:5556,localhost:5566
 
 # MÁQUINA 1 (Windows) — cliente o generador de carga
-java -cp target\srb.jar cliente.ClienteMain --gt=192.168.56.101:5555
-java -cp target\srb.jar pruebas.GeneradorCargaMain --escenario=A --gt=192.168.56.101:5555
+java -cp target\srb.jar cliente.ClienteMain --gt=192.168.56.101:5555,192.168.56.101:5565 --ip=192.168.56.1 --puerto-notif=6001
+java -cp target\srb.jar pruebas.GeneradorCargaMain --escenario=A --gt=192.168.56.101:5555,192.168.56.101:5565 --ip=192.168.56.1
 ```
+
+En el cliente y el generador, `--gt` lleva el GT primario y luego el de respaldo (si el primario no
+responde, el cliente reintenta en el otro) e `--ip` es la IP de Windows en la red de VirtualBox: es la
+dirección a la que el Servicio de Cancelaciones envía las notificaciones. Sin `--ip=192.168.56.1` las
+notificaciones salen hacia `127.0.0.1` de la VM y no llegan.
 
 Opciones útiles del GT: `--metricas=60` (imprime el TPM por tipo cada 60 s), `--timeout-rmc=2000`.
 
