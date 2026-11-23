@@ -4,18 +4,50 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.UncheckedIOException;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentSkipListMap;
 
+/**
+ * Cliente interactivo de consola del SRB.
+ *
+ * <p>Consulta, reserva y modificación son síncronas (REQ/REP). La cancelación es asíncrona: el GT responde
+ * ACEPTADA y el resultado llega después al {@link ReceptorNotificaciones}. Cada operación lleva un idSol que
+ * se repite en sus reintentos, por lo que reintentar en el GT de respaldo no duplica operaciones.</p>
+ */
 public class ClienteMain {
 
-    private static final String HOST_DEFECTO = "localhost";
-    private static final int PUERTO_DEFECTO = 5555;
-    private static final int TIMEOUT_DEFECTO_MS = 5000;
+    private static final String GT_DEFECTO = "localhost:5555,localhost:5565";
+    private static final String IP_DEFECTO = "127.0.0.1";
+    private static final int PUERTO_NOTIF_DEFECTO = 6001;
+    private static final int TIMEOUT_DEFECTO_MS = 3000;
     private static final int REINTENTOS_DEFECTO = 2;
+
+    /** Estado de una reserva hecha en esta sesión. */
+    enum EstadoReserva { ACTIVA, CANCELACION_EN_CURSO, CANCELADA, CANCELACION_RECHAZADA }
+
+    /** Reserva hecha en esta sesión. El estado lo actualiza también el hilo de notificaciones. */
+    static final class ReservaLocal {
+        final String evento;
+        volatile int ocurrencia;
+        volatile int cantidad;
+        volatile EstadoReserva estado = EstadoReserva.ACTIVA;
+
+        ReservaLocal(String evento, int ocurrencia, int cantidad) {
+            this.evento = evento;
+            this.ocurrencia = ocurrencia;
+            this.cantidad = cantidad;
+        }
+    }
 
     private final ConexionGt conexion;
     private final BufferedReader entrada;
-    private final int reintentosConsulta;
+    private final int intentos;
+    private final String ipCliente;
+    private final int puertoNotificaciones;
+    private final boolean recibeNotificaciones;
+    /** Compartido con el hilo de notificaciones; ordenado por número de reserva. */
+    private final Map<Long, ReservaLocal> reservas = new ConcurrentSkipListMap<>();
 
     private static class FinDeEntrada extends RuntimeException {
         private static final long serialVersionUID = 1L;
@@ -25,31 +57,38 @@ public class ClienteMain {
         }
     }
 
-    ClienteMain(ConexionGt conexion, BufferedReader entrada, int reintentosConsulta) {
+    ClienteMain(ConexionGt conexion, BufferedReader entrada, int reintentos, String ipCliente,
+                int puertoNotificaciones, boolean recibeNotificaciones) {
         this.conexion = conexion;
         this.entrada = entrada;
-        this.reintentosConsulta = reintentosConsulta;
+        this.intentos = 1 + reintentos;
+        this.ipCliente = ipCliente;
+        this.puertoNotificaciones = puertoNotificaciones;
+        this.recibeNotificaciones = recibeNotificaciones;
     }
 
     public static void main(String[] args) {
-        String host = HOST_DEFECTO;
-        int puerto = PUERTO_DEFECTO;
+        List<String> gts;
+        String ip = IP_DEFECTO;
+        int puertoNotif = PUERTO_NOTIF_DEFECTO;
         int timeoutMs = TIMEOUT_DEFECTO_MS;
         int reintentos = REINTENTOS_DEFECTO;
 
         try {
+            String gtTexto = GT_DEFECTO;
             for (String arg : args) {
                 if (arg.equals("--ayuda") || arg.equals("-h") || arg.equals("--help")) {
                     imprimirAyuda();
                     return;
                 } else if (arg.startsWith("--gt=")) {
-                    String valor = arg.substring("--gt=".length());
-                    int dosPuntos = valor.lastIndexOf(':');
-                    if (dosPuntos <= 0 || dosPuntos == valor.length() - 1) {
-                        throw new IllegalArgumentException("Use --gt=host:puerto, por ejemplo --gt=192.168.0.10:5555");
+                    gtTexto = arg.substring("--gt=".length());
+                } else if (arg.startsWith("--ip=")) {
+                    ip = arg.substring("--ip=".length()).trim();
+                    if (ip.isEmpty() || ip.contains(":")) {
+                        throw new IllegalArgumentException("--ip debe ser una dirección IPv4 o un nombre de equipo");
                     }
-                    host = valor.substring(0, dosPuntos);
-                    puerto = enteroEnRango(valor.substring(dosPuntos + 1), 1, 65535, "puerto");
+                } else if (arg.startsWith("--puerto-notif=")) {
+                    puertoNotif = enteroEnRango(arg.substring("--puerto-notif=".length()), 1, 65535, "puerto-notif");
                 } else if (arg.startsWith("--timeout=")) {
                     timeoutMs = enteroEnRango(arg.substring("--timeout=".length()), 100, 600_000, "timeout");
                 } else if (arg.startsWith("--reintentos=")) {
@@ -58,6 +97,7 @@ public class ClienteMain {
                     throw new IllegalArgumentException("Argumento no reconocido: " + arg);
                 }
             }
+            gts = ConexionGt.parsearDirecciones(gtTexto);
         } catch (IllegalArgumentException e) {
             System.out.println("Error en los argumentos: " + e.getMessage());
             imprimirAyuda();
@@ -66,10 +106,28 @@ public class ClienteMain {
         }
 
         BufferedReader teclado = new BufferedReader(new InputStreamReader(System.in));
-        try (ConexionGt conexion = new ConexionGt(host, puerto, timeoutMs)) {
-            new ClienteMain(conexion, teclado, reintentos).ejecutar();
+        ReceptorNotificaciones receptor = null;
+        ClienteMain[] cliente = new ClienteMain[1];
+        try {
+            receptor = new ReceptorNotificaciones(puertoNotif, (n, texto) -> {
+                if (cliente[0] != null) {
+                    cliente[0].procesarNotificacion(n, texto);
+                }
+            });
+        } catch (IllegalStateException e) {
+            System.out.println("AVISO: " + e.getMessage());
+            System.out.println("Las notificaciones de cancelación no llegarán. Use otro --puerto-notif.");
         }
-        System.out.println("Cliente finalizado. Socket y contexto ZeroMQ cerrados.");
+
+        try (ConexionGt conexion = new ConexionGt(gts, timeoutMs)) {
+            cliente[0] = new ClienteMain(conexion, teclado, reintentos, ip, puertoNotif, receptor != null);
+            cliente[0].ejecutar();
+        } finally {
+            if (receptor != null) {
+                receptor.close();
+            }
+        }
+        System.out.println("Cliente finalizado. Sockets y contextos ZeroMQ cerrados.");
     }
 
     private static int enteroEnRango(String texto, int min, int max, String nombre) {
@@ -85,16 +143,22 @@ public class ClienteMain {
     }
 
     private static void imprimirAyuda() {
-        System.out.println("Uso: cliente.ClienteMain [--gt=host:puerto] [--timeout=ms] [--reintentos=n]");
-        System.out.println("  --gt          dirección del Gestor de Transacciones (defecto localhost:5555)");
-        System.out.println("  --timeout     espera máxima por respuesta en ms (defecto 5000)");
-        System.out.println("  --reintentos  reintentos automáticos SOLO para CONSULTA (defecto 2)");
+        System.out.println("Uso: cliente.ClienteMain [--gt=host:puerto[,host:puerto]] [--ip=IP] [--puerto-notif=6001]");
+        System.out.println("                         [--timeout=3000] [--reintentos=2]");
+        System.out.println("  --gt            GT primario y de respaldo (defecto " + GT_DEFECTO + ")");
+        System.out.println("  --ip            IP de este equipo a la que llegan las notificaciones (defecto " + IP_DEFECTO + ")");
+        System.out.println("  --puerto-notif  puerto local para recibir notificaciones (defecto " + PUERTO_NOTIF_DEFECTO + ")");
+        System.out.println("  --timeout       espera máxima por respuesta en ms (defecto " + TIMEOUT_DEFECTO_MS + ")");
+        System.out.println("  --reintentos    reintentos por operación, alternando GT (defecto " + REINTENTOS_DEFECTO + ")");
     }
 
     void ejecutar() {
         System.out.println("==========================================");
-        System.out.println("[Cliente SRB] Gestor de Transacciones: " + conexion.getEndpoint());
-        System.out.println("[Cliente SRB] Tiempo límite por solicitud: " + conexion.getTimeoutMs() + " ms");
+        System.out.println("[Cliente SRB] Gestores de Transacciones: " + String.join(", ", conexion.getEndpoints()));
+        System.out.println("[Cliente SRB] Tiempo límite " + conexion.getTimeoutMs() + " ms, " + intentos
+                + " intento(s) por operación");
+        System.out.println("[Cliente SRB] Notificaciones en tcp://" + ipCliente + ":" + puertoNotificaciones
+                + (recibeNotificaciones ? "" : " (NO disponible)"));
         System.out.println("==========================================");
         try {
             boolean continuar = true;
@@ -104,6 +168,9 @@ public class ClienteMain {
                 System.out.println("1. Consultar todos los eventos");
                 System.out.println("2. Reservar asientos");
                 System.out.println("3. Ver disponibilidad de un evento");
+                System.out.println("4. Mis reservas");
+                System.out.println("5. Modificar una reserva");
+                System.out.println("6. Cancelar una reserva");
                 System.out.println("0. Salir");
                 String opcion = leer("Opción: ").trim();
                 switch (opcion) {
@@ -116,11 +183,20 @@ public class ClienteMain {
                     case "3":
                         opcionVerEvento();
                         break;
+                    case "4":
+                        imprimirReservas();
+                        break;
+                    case "5":
+                        opcionModificar();
+                        break;
+                    case "6":
+                        opcionCancelar();
+                        break;
                     case "0":
                         continuar = false;
                         break;
                     default:
-                        System.out.println("Opción no válida. Escriba 1, 2, 3 o 0.");
+                        System.out.println("Opción no válida. Escriba un número del 0 al 6.");
                 }
             }
         } catch (FinDeEntrada e) {
@@ -130,14 +206,14 @@ public class ClienteMain {
     }
 
     private void opcionConsultar() {
-        Map<String, EventoDto> eventos = consultarConReintentos();
+        Map<String, EventoDto> eventos = consultar();
         if (eventos != null) {
             imprimirTabla(eventos);
         }
     }
 
     private void opcionVerEvento() {
-        Map<String, EventoDto> eventos = consultarConReintentos();
+        Map<String, EventoDto> eventos = consultar();
         if (eventos == null) {
             return;
         }
@@ -147,17 +223,13 @@ public class ClienteMain {
         }
     }
 
-    // ------------------------------------------------------------------ opción 2
-
     private void opcionReservar() {
-        // 1) Catálogo fresco: así el usuario elige con datos actuales y validamos contra ellos.
-        Map<String, EventoDto> eventos = consultarConReintentos();
+        // Catálogo actualizado para validar la selección del usuario.
+        Map<String, EventoDto> eventos = consultar();
         if (eventos == null) {
             System.out.println("No se puede reservar sin consultar primero el catálogo.");
             return;
         }
-
-        // 2) Evento
         String id = pedirIdEvento(eventos);
         if (id == null) {
             return;
@@ -165,21 +237,19 @@ public class ClienteMain {
         EventoDto evento = eventos.get(id);
         imprimirEvento(evento);
 
-        // 3) Ocurrencia (si solo hay una, se elige automáticamente)
         int ocurrencia;
         if (evento.getOcurrencias() == 1) {
             ocurrencia = 1;
             System.out.println("El evento tiene una sola ocurrencia; se usará la ocurrencia 1.");
         } else {
-            Integer elegida = pedirOcurrencia(evento);
+            Integer elegida = pedirOcurrencia(evento, null);
             if (elegida == null) {
                 return;
             }
             ocurrencia = elegida;
         }
 
-        // 4) Cantidad
-        Integer cantidad = pedirCantidad();
+        Integer cantidad = pedirCantidad(null);
         if (cantidad == null) {
             return;
         }
@@ -188,46 +258,173 @@ public class ClienteMain {
             System.out.println("Aviso: según la última consulta solo hay " + disponiblesAntes
                     + " asientos. El servidor probablemente rechazará la solicitud.");
         }
-
-        // 5) Confirmación
-        String mensaje = ProtocoloSrb.mensajeReserva(id, ocurrencia, cantidad);
         if (!confirmar("¿Reservar " + cantidad + " asiento(s) en " + id + ", ocurrencia " + ocurrencia
                 + " (" + evento.getFecha(ocurrencia) + ")? (s/n): ")) {
             System.out.println("Reserva cancelada por el usuario; no se envió nada.");
             return;
         }
 
-        // 6) Envío: UN solo intento. Una reserva NO es idempotente: si se pierde la respuesta
-        //    y reintentamos, el servidor podría descontar los asientos dos veces.
-        System.out.println("Enviando: " + mensaje);
-        long inicio = System.nanoTime();
+        String idSol = ProtocoloSrb.nuevoIdSolicitud();
+        String mensaje = ProtocoloSrb.mensajeReserva(idSol, id, ocurrencia, cantidad);
+        String respuesta = enviar("RESERVA", mensaje);
+        if (respuesta == null) {
+            return;
+        }
         try {
-            String respuesta = conexion.enviar(mensaje);
-            double latenciaMs = (System.nanoTime() - inicio) / 1_000_000.0;
-            ResultadoReserva resultado = ResultadoReserva.desde(respuesta);
-
-            if (resultado == ResultadoReserva.EXITOSA) {
-                System.out.printf("RESERVA EXITOSA (respuesta \"%s\" en %.2f ms)%n", respuesta, latenciaMs);
+            if (ResultadoReserva.desde(respuesta) == ResultadoReserva.EXITOSA) {
+                long idReserva = ProtocoloSrb.idReserva(respuesta);
+                System.out.println("RESERVA EXITOSA. Número de reserva: " + idReserva);
+                if (idReserva > 0) {
+                    reservas.put(idReserva, new ReservaLocal(id, ocurrencia, cantidad));
+                }
                 mostrarCambio(id, ocurrencia, disponiblesAntes, cantidad);
             } else {
-                System.out.printf("RESERVA RECHAZADA por el servidor (respuesta \"%s\" en %.2f ms).%n",
-                        respuesta, latenciaMs);
-                System.out.println("Motivo más probable: no hay suficientes asientos disponibles en esa ocurrencia.");
+                System.out.println("RESERVA RECHAZADA: no hay suficientes asientos disponibles en esa ocurrencia.");
             }
         } catch (ErrorComunicacionException e) {
-            System.out.println("FALLO DE COMUNICACIÓN [" + e.getTipo() + "]: " + e.getMessage());
-            if (e.pudoHaberseProcesado()) {
-                System.out.println("La reserva pudo haberse aplicado o no. NO se reintenta automáticamente;");
-                System.out.println("consulte la disponibilidad (opción 3) antes de volver a intentarlo.");
-            } else {
-                System.out.println("La solicitud no salió del cliente, así que no se aplicó ninguna reserva.");
-            }
+            System.out.println("RESPUESTA INVÁLIDA: " + e.getMessage());
         }
+    }
+
+    private void opcionModificar() {
+        imprimirReservas();
+        Long idReserva = pedirIdReserva();
+        if (idReserva == null) {
+            return;
+        }
+        ReservaLocal local = reservas.get(idReserva);
+        if (local != null && local.estado != EstadoReserva.ACTIVA) {
+            System.out.println("La reserva " + idReserva + " no está activa (" + local.estado + ").");
+            return;
+        }
+
+        int ocurrenciaNueva;
+        int cantidadNueva;
+        if (local != null) {
+            Map<String, EventoDto> eventos = consultar();
+            EventoDto evento = eventos == null ? null : eventos.get(local.evento);
+            if (evento == null) {
+                System.out.println("No se pudo obtener la información del evento " + local.evento + ".");
+                return;
+            }
+            System.out.println("Reserva actual: " + local.cantidad + " asiento(s) en " + local.evento
+                    + ", ocurrencia " + local.ocurrencia + " (" + evento.getFecha(local.ocurrencia) + ").");
+            imprimirEvento(evento);
+            if (evento.getOcurrencias() == 1) {
+                ocurrenciaNueva = 1;
+                System.out.println("El evento tiene una sola fecha; solo se puede cambiar la cantidad.");
+            } else {
+                Integer o = pedirOcurrencia(evento, local.ocurrencia);
+                if (o == null) {
+                    return;
+                }
+                ocurrenciaNueva = o;
+            }
+            Integer c = pedirCantidad(local.cantidad);
+            if (c == null) {
+                return;
+            }
+            cantidadNueva = c;
+            if (ocurrenciaNueva == local.ocurrencia && cantidadNueva == local.cantidad) {
+                System.out.println("No hay cambios; no se envió nada.");
+                return;
+            }
+        } else {
+            // Reserva de otra sesión: el servidor valida la ocurrencia contra el evento real.
+            System.out.println("La reserva " + idReserva + " no es de esta sesión; el servidor validará los datos.");
+            Integer o = pedirEnteroPositivo("Nueva ocurrencia (1 o 2, vacío para cancelar): ");
+            if (o == null) {
+                return;
+            }
+            Integer c = pedirCantidad(null);
+            if (c == null) {
+                return;
+            }
+            ocurrenciaNueva = o;
+            cantidadNueva = c;
+        }
+
+        if (!confirmar("¿Modificar la reserva " + idReserva + " a " + cantidadNueva + " asiento(s) en la ocurrencia "
+                + ocurrenciaNueva + "? (s/n): ")) {
+            System.out.println("Modificación cancelada por el usuario; no se envió nada.");
+            return;
+        }
+        String idSol = ProtocoloSrb.nuevoIdSolicitud();
+        String respuesta = enviar("MODIFICAR",
+                ProtocoloSrb.mensajeModificar(idSol, idReserva, ocurrenciaNueva, cantidadNueva));
+        if (respuesta == null) {
+            return;
+        }
+        try {
+            if (ResultadoReserva.desde(respuesta) == ResultadoReserva.EXITOSA) {
+                System.out.println("MODIFICACIÓN EXITOSA.");
+                if (local != null) {
+                    local.ocurrencia = ocurrenciaNueva;
+                    local.cantidad = cantidadNueva;
+                }
+            } else {
+                System.out.println("MODIFICACIÓN RECHAZADA: no hay cupo para el cambio, o la reserva no existe"
+                        + " o no está activa. La reserva no cambió.");
+            }
+        } catch (ErrorComunicacionException e) {
+            System.out.println("RESPUESTA INVÁLIDA: " + e.getMessage());
+        }
+    }
+
+    private void opcionCancelar() {
+        imprimirReservas();
+        Long idReserva = pedirIdReserva();
+        if (idReserva == null) {
+            return;
+        }
+        ReservaLocal local = reservas.get(idReserva);
+        if (local != null && local.estado != EstadoReserva.ACTIVA) {
+            System.out.println("La reserva " + idReserva + " no está activa (" + local.estado + ").");
+            return;
+        }
+        if (!recibeNotificaciones) {
+            System.out.println("Aviso: el receptor de notificaciones no está activo; no verá el resultado.");
+        }
+        if (!confirmar("¿Cancelar la reserva " + idReserva + "? (s/n): ")) {
+            System.out.println("Cancelación descartada por el usuario; no se envió nada.");
+            return;
+        }
+        String idSol = ProtocoloSrb.nuevoIdSolicitud();
+        String respuesta = enviar("CANCELAR",
+                ProtocoloSrb.mensajeCancelar(idSol, idReserva, ipCliente, puertoNotificaciones));
+        if (respuesta == null) {
+            return;
+        }
+        if (ProtocoloSrb.RESPUESTA_ACEPTADA.equals(respuesta)) {
+            System.out.println("CANCELACIÓN ACEPTADA. El resultado llegará como notificación.");
+            if (local != null) {
+                local.estado = EstadoReserva.CANCELACION_EN_CURSO;
+            }
+        } else {
+            System.out.println("El servidor no aceptó la cancelación: " + respuesta);
+        }
+    }
+
+    /** Ejecutado en el hilo receptor cuando llega una notificación. */
+    void procesarNotificacion(ProtocoloSrb.Notificacion n, String texto) {
+        if (n == null) {
+            System.out.println(System.lineSeparator() + "[NOTIFICACIÓN] Mensaje no reconocido: " + texto);
+            return;
+        }
+        ReservaLocal local = reservas.get(n.idReserva());
+        if (local != null) {
+            local.estado = n.cancelada() ? EstadoReserva.CANCELADA : EstadoReserva.CANCELACION_RECHAZADA;
+        }
+        System.out.println(System.lineSeparator() + "[NOTIFICACIÓN] Reserva " + n.idReserva()
+                + (n.cancelada() ? " CANCELADA: los asientos fueron liberados."
+                : ": la cancelación fue RECHAZADA (la reserva no existe o ya estaba cancelada)."));
+        System.out.print("Opción: ");
+        System.out.flush();
     }
 
     /** Consulta de nuevo para comprobar la disponibilidad después de una reserva exitosa. */
     private void mostrarCambio(String id, int ocurrencia, int antes, int cantidad) {
-        Map<String, EventoDto> eventos = consultarConReintentos();
+        Map<String, EventoDto> eventos = consultar();
         if (eventos == null || !eventos.containsKey(id)) {
             System.out.println("No se pudo consultar la disponibilidad actualizada.");
             return;
@@ -243,32 +440,41 @@ public class ClienteMain {
 
     // ------------------------------------------------------------------ comunicación
 
-    /**
-     * Envía CONSULTA. Como consultar NO modifica datos (es idempotente), sí es seguro
-     * reintentar cuando falla la comunicación.
-     *
-     * @return eventos ordenados, o null si todos los intentos fallaron
-     */
-    private Map<String, EventoDto> consultarConReintentos() {
-        int intentos = 1 + reintentosConsulta;
-        for (int i = 1; i <= intentos; i++) {
-            long inicio = System.nanoTime();
-            try {
-                String respuesta = conexion.enviar(ProtocoloSrb.CONSULTA);
-                Map<String, EventoDto> eventos = ProtocoloSrb.parsearConsulta(respuesta);
-                double latenciaMs = (System.nanoTime() - inicio) / 1_000_000.0;
-                System.out.printf("[CONSULTA] %d eventos recibidos en %.2f ms%n", eventos.size(), latenciaMs);
-                return eventos;
-            } catch (ErrorComunicacionException e) {
-                System.out.println("[CONSULTA] Intento " + i + "/" + intentos + " fallido ["
-                        + e.getTipo() + "]: " + e.getMessage());
-                if (e.getTipo() == ErrorComunicacionException.Tipo.RESPUESTA_INVALIDA) {
-                    return null; // el servidor contestó algo inválido; reintentar no lo arregla
-                }
-            }
+    /** CONSULTA con reintentos. Devuelve los eventos ordenados, o null si no fue posible. */
+    private Map<String, EventoDto> consultar() {
+        String respuesta = enviar("CONSULTA", ProtocoloSrb.mensajeConsulta(ProtocoloSrb.nuevoIdSolicitud()));
+        if (respuesta == null) {
+            return null;
         }
-        System.out.println("[CONSULTA] El Gestor de Transacciones no está disponible.");
-        return null;
+        try {
+            return ProtocoloSrb.parsearConsulta(respuesta);
+        } catch (ErrorComunicacionException e) {
+            System.out.println("[CONSULTA] " + e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Envía un mensaje con reintentos sobre los GT configurados. El mensaje conserva su idSol en todos
+     * los intentos, de modo que un reintento nunca aplica dos veces la misma operación.
+     * Devuelve null si todos los intentos fallaron.
+     */
+    private String enviar(String operacion, String mensaje) {
+        long inicio = System.nanoTime();
+        try {
+            String respuesta = conexion.enviarConReintentos(mensaje, intentos,
+                    aviso -> System.out.println("[" + operacion + "] " + aviso));
+            System.out.printf("[%s] Respuesta de %s en %.2f ms%n", operacion, conexion.getEndpoint(),
+                    (System.nanoTime() - inicio) / 1_000_000.0);
+            return respuesta;
+        } catch (ErrorComunicacionException e) {
+            if (e.getTipo() == ErrorComunicacionException.Tipo.RESPUESTA_INVALIDA) {
+                System.out.println("[" + operacion + "] Respuesta inválida: " + e.getMessage());
+            } else {
+                System.out.println("[" + operacion + "] Ningún Gestor de Transacciones respondió.");
+            }
+            return null;
+        }
     }
 
     // ------------------------------------------------------------------ entrada del usuario
@@ -288,7 +494,7 @@ public class ClienteMain {
         }
     }
 
-    /** @return id válido, o null si el usuario deja la línea vacía para cancelar */
+    /** Devuelve un identificador válido, o null si el usuario deja la línea vacía. */
     private String pedirIdEvento(Map<String, EventoDto> eventos) {
         while (true) {
             String texto = leer("Identificador del evento (ej. E2, vacío para cancelar): ");
@@ -303,11 +509,13 @@ public class ClienteMain {
         }
     }
 
-    private Integer pedirOcurrencia(EventoDto evento) {
+    // Si el usuario deja la línea vacía se conserva "actual". Devuelve null si cancela.
+    private Integer pedirOcurrencia(EventoDto evento, Integer actual) {
         while (true) {
-            String texto = leer("Ocurrencia (1-" + evento.getOcurrencias() + ", vacío para cancelar): ");
+            String texto = leer("Ocurrencia (1-" + evento.getOcurrencias()
+                    + (actual == null ? ", vacío para cancelar): " : ", vacío para mantener " + actual + "): "));
             if (texto.isBlank()) {
-                return null;
+                return actual;
             }
             try {
                 return ValidadorEntrada.validarOcurrencia(texto, evento);
@@ -317,14 +525,43 @@ public class ClienteMain {
         }
     }
 
-    private Integer pedirCantidad() {
+    private Integer pedirCantidad(Integer actual) {
         while (true) {
-            String texto = leer("Cantidad de asientos (vacío para cancelar): ");
+            String texto = leer("Cantidad de asientos"
+                    + (actual == null ? " (vacío para cancelar): " : " (vacío para mantener " + actual + "): "));
+            if (texto.isBlank()) {
+                return actual;
+            }
+            try {
+                return ValidadorEntrada.validarCantidad(texto);
+            } catch (IllegalArgumentException e) {
+                System.out.println("  " + e.getMessage());
+            }
+        }
+    }
+
+    private Integer pedirEnteroPositivo(String prompt) {
+        while (true) {
+            String texto = leer(prompt);
             if (texto.isBlank()) {
                 return null;
             }
             try {
                 return ValidadorEntrada.validarCantidad(texto);
+            } catch (IllegalArgumentException e) {
+                System.out.println("  Debe ser un número entero mayor que cero.");
+            }
+        }
+    }
+
+    private Long pedirIdReserva() {
+        while (true) {
+            String texto = leer("Número de reserva (vacío para cancelar): ");
+            if (texto.isBlank()) {
+                return null;
+            }
+            try {
+                return ValidadorEntrada.validarIdReserva(texto);
             } catch (IllegalArgumentException e) {
                 System.out.println("  " + e.getMessage());
             }
@@ -345,6 +582,18 @@ public class ClienteMain {
     }
 
     // ------------------------------------------------------------------ presentación
+
+    private void imprimirReservas() {
+        if (reservas.isEmpty()) {
+            System.out.println("No hay reservas registradas en esta sesión.");
+            return;
+        }
+        System.out.printf("%-8s %-7s %-6s %9s  %s%n", "Reserva", "Evento", "Ocur.", "Asientos", "Estado");
+        for (Map.Entry<Long, ReservaLocal> e : reservas.entrySet()) {
+            ReservaLocal r = e.getValue();
+            System.out.printf("%-8d %-7s %-6d %9d  %s%n", e.getKey(), r.evento, r.ocurrencia, r.cantidad, r.estado);
+        }
+    }
 
     private static void imprimirTabla(Map<String, EventoDto> eventos) {
         System.out.println();

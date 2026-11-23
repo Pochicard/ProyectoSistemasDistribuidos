@@ -16,17 +16,9 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Validación automática del generador de carga contra el backend en ejecución (unos 30 s).
- *
- * <p>Fase 1 (12 s, 3 clientes): conexión, concurrencia, sockets independientes, respuestas, frecuencia,
- * registro y formato del CSV, coherencia del resumen, liberación de recursos y consistencia de asientos.</p>
- *
- * <p>Fase 2 (15 s, 4 clientes): reservas concurrentes sobre una misma ocurrencia hasta agotarla, para
- * comprobar que la disponibilidad no queda negativa y que lo descontado coincide con lo reservado.</p>
- *
- * <p>Consume asientos, por lo que se debe reiniciar Persistencia antes de ejecutar los escenarios.</p>
- *
- * <pre>java -cp "target/classes;target/dependency/*" pruebas.ValidacionGeneradorMain [--gt=localhost:5555]</pre>
+ * Validación automática del generador contra el backend en ejecución (unos 40 s): funcionamiento general
+ * con todas las operaciones (fase 1) y contención sobre una misma ocurrencia (fase 2). Consume asientos,
+ * así que después hay que arrancar Persistencia con --reiniciar.
  */
 public class ValidacionGeneradorMain {
 
@@ -34,26 +26,36 @@ public class ValidacionGeneradorMain {
     private int pasan;
     private int fallan;
 
+    /** Parámetros de conexión que se pueden indicar; los demás los fija la validación. */
+    private static final List<String> PERMITIDOS = List.of("--gt=", "--timeout=", "--ip=", "--puerto-notif=", "--protocolo=");
+
     public static void main(String[] args) throws Exception {
-        String gt = "--gt=localhost:5555";
-        String timeout = "--timeout=5000";
+        List<String> conexion = new ArrayList<>();
         for (String a : args) {
-            if (a.startsWith("--gt=")) {
-                gt = a;
-            } else if (a.startsWith("--timeout=")) {
-                timeout = a;
+            if (PERMITIDOS.stream().noneMatch(a::startsWith)) {
+                System.out.println("Parámetro no admitido: " + a + " (se admiten " + PERMITIDOS + ")");
+                System.exit(2);
             }
+            conexion.add(a);
         }
-        System.exit(new ValidacionGeneradorMain().ejecutar(gt, timeout) ? 0 : 1);
+        System.exit(new ValidacionGeneradorMain().ejecutar(conexion) ? 0 : 1);
     }
 
-    boolean ejecutar(String gt, String timeout) throws Exception {
-        Path carpeta = Paths.get("resultados", "validacion");
+    private static String[] argumentos(List<String> conexion, String... propios) {
+        List<String> todos = new ArrayList<>(List.of(propios));
+        todos.addAll(conexion);
+        return todos.toArray(new String[0]);
+    }
 
-        // Fase 1: funcionamiento general
-        ConfiguracionCarga f1 = ConfiguracionCarga.desdeArgumentos(new String[]{
-                "--clientes=3", "--solo-consulta=1", "--duracion=12", "--rpm=30", "--pct-reserva=50",
-                "--asientos=1-2", "--seleccion=aleatoria", gt, timeout, "--salida=" + carpeta});
+    boolean ejecutar(List<String> conexion) throws Exception {
+        Path carpeta = Paths.get("resultados", "validacion");
+        boolean v2 = conexion.stream().noneMatch(a -> a.equals("--protocolo=v1"));
+
+        // Fase 1: funcionamiento general (con v2 incluye modificaciones y cancelaciones)
+        ConfiguracionCarga f1 = ConfiguracionCarga.desdeArgumentos(argumentos(conexion,
+                "--clientes=3", "--solo-consulta=1", "--duracion=15", "--rpm=60", "--pct-reserva=50",
+                "--pct-modificacion=" + (v2 ? 20 : 0), "--pct-cancelacion=" + (v2 ? 15 : 0),
+                "--asientos=1-2", "--seleccion=aleatoria", "--salida=" + carpeta));
         f1.nombre = "validacion";
         GeneradorCarga.ResultadoEjecucion r1;
         try {
@@ -96,10 +98,20 @@ public class ValidacionGeneradorMain {
                 m.consulta().enviadas() > 0 && m.consulta().ok() == m.consulta().enviadas(),
                 m.consulta().ok() + " de " + m.consulta().enviadas() + " consultas con JSON válido");
 
-        verificar("5. Las reservas reciben OK o RECHAZADO",
-                m.reserva().enviadas() > 0 && m.reserva().respondidas() == m.reserva().enviadas(),
-                m.reserva().ok() + " OK + " + m.reserva().rechazadas() + " RECHAZADO de "
-                        + m.reserva().enviadas() + " reservas");
+        List<TipoOperacion> operaciones = v2
+                ? List.of(TipoOperacion.RESERVA, TipoOperacion.MODIFICACION, TipoOperacion.CANCELACION)
+                : List.of(TipoOperacion.RESERVA);
+        boolean respondidas = true;
+        StringBuilder detalle = new StringBuilder();
+        for (TipoOperacion t : operaciones) {
+            AnalizadorMetricas.Estadistica e = m.de(t);
+            respondidas &= e.enviadas() > 0 && e.respondidas() == e.enviadas();
+            detalle.append(t).append(": ").append(e.ok()).append(" OK + ").append(e.rechazadas())
+                    .append(" rechazadas de ").append(e.enviadas()).append("; ");
+        }
+        verificar(v2 ? "5. Reservas, modificaciones y cancelaciones reciben respuesta válida"
+                        : "5. Las reservas reciben OK o RECHAZADO",
+                respondidas, detalle.toString().trim());
 
         double esperado = f1.duracionSeg * f1.rpm / 60.0;
         double tolerancia = Math.max(1, esperado * 0.15);
@@ -114,15 +126,16 @@ public class ValidacionGeneradorMain {
                         detalleRitmo.toString().trim()));
 
         long enviadasClientes = r1.clientes().stream().mapToLong(ClienteSimulado.Resumen::enviadas).sum();
+        long esperadas = enviadasClientes + r1.notificacionesRegistradas();
         verificar("7. Cada transacción queda registrada en el CSV",
-                enviadasClientes == r1.registrosEscritos() && enviadasClientes == m.registrosTotales()
+                esperadas == r1.registrosEscritos() && esperadas == m.registrosTotales()
                         && r1.errorEscritura() == null,
-                enviadasClientes + " enviadas = " + r1.registrosEscritos() + " escritas = "
-                        + m.registrosTotales() + " leídas del CSV");
+                enviadasClientes + " enviadas + " + r1.notificacionesRegistradas() + " notificaciones = "
+                        + r1.registrosEscritos() + " escritas = " + m.registrosTotales() + " leídas del CSV");
 
         String errorFormato = revisarFormatoCsv(r1, f1);
         verificar("8. Columnas y datos del CSV correctos", errorFormato == null,
-                errorFormato == null ? "encabezado, 10 columnas, ids únicos, valores válidos, CSV Excel con igual número de filas"
+                errorFormato == null ? "encabezado, 11 columnas, ids únicos, valores válidos, CSV Excel con igual número de filas"
                         : errorFormato);
 
         verificar("9. El resumen estadístico coincide con los registros",
@@ -138,19 +151,29 @@ public class ValidacionGeneradorMain {
         GeneradorCarga.Consistencia c1 = r1.consistencia();
         verificar("11. Disponibilidad consistente tras la carga",
                 c1.verificada() && c1.correcta() && !c1.hayNegativos(),
-                c1.asientosReservadosOk() + " asientos reservados OK = " + c1.asientosDescontados()
+                c1.asientosReservadosOk() + " asientos en reservas activas = " + c1.asientosDescontados()
                         + " descontados en el servidor");
 
+        if (v2) {
+            AnalizadorMetricas.Estadistica canc = m.de(TipoOperacion.CANCELACION);
+            AnalizadorMetricas.Estadistica notif = m.de(TipoOperacion.NOTIF_CANCELACION);
+            verificar("12. Llegan las notificaciones de las cancelaciones aceptadas",
+                    canc.ok() > 0 && notif.enviadas() == canc.ok() && notif.ok() == canc.ok()
+                            && notif.sinRespuesta() == 0,
+                    canc.ok() + " cancelaciones aceptadas, " + notif.ok() + " notificaciones CANCELADA, "
+                            + notif.sinRespuesta() + " sin llegar; tiempo promedio hasta la notificación "
+                            + String.format(Locale.ROOT, "%.1f ms", notif.promedioMs()));
+        }
+
         // Fase 2: contención sobre una sola ocurrencia
-        ConfiguracionCarga f2 = ConfiguracionCarga.desdeArgumentos(new String[]{
+        ConfiguracionCarga f2 = ConfiguracionCarga.desdeArgumentos(argumentos(conexion,
                 "--clientes=4", "--solo-consulta=0", "--duracion=15", "--rpm=60", "--pct-reserva=100",
-                "--asientos=3", "--seleccion=fija", "--evento=E50", "--ocurrencia=1", gt, timeout,
-                "--salida=" + carpeta});
+                "--asientos=3", "--seleccion=fija", "--evento=E50", "--ocurrencia=1", "--salida=" + carpeta));
         f2.nombre = "contencion";
         GeneradorCarga.ResultadoEjecucion r2 = new GeneradorCarga(System.out).ejecutar(f2, new AtomicBoolean(false));
         GeneradorCarga.Consistencia c2 = r2.consistencia();
         AnalizadorMetricas.Estadistica res2 = r2.metricas().reserva();
-        verificar("12. Concurrencia sobre una misma ocurrencia sin sobreventa",
+        verificar((v2 ? "13" : "12") + ". Concurrencia sobre una misma ocurrencia sin sobreventa",
                 c2.verificada() && c2.correcta() && !c2.hayNegativos() && res2.rechazadas() > 0
                         && res2.erroresTecnicos() == 0,
                 res2.ok() + " reservas OK (" + c2.asientosReservadosOk() + " asientos) y " + res2.rechazadas()
@@ -159,7 +182,7 @@ public class ValidacionGeneradorMain {
 
         imprimirInforme();
         System.out.println("Archivos de la validación en: " + carpeta.toAbsolutePath());
-        System.out.println("IMPORTANTE: reinicie Persistencia antes de ejecutar los escenarios A, B y C.");
+        System.out.println("IMPORTANTE: arranque Persistencia con --reiniciar antes de ejecutar los escenarios A, B y C.");
         return fallan == 0;
     }
 
@@ -181,7 +204,8 @@ public class ValidacionGeneradorMain {
             } catch (RuntimeException e) {
                 return "línea " + (i + 1) + " no se puede interpretar: " + e.getMessage();
             }
-            if (!ids.add(t.solicitudId())) {
+            // La notificación comparte solicitud_id con su CANCELACION.
+            if (t.tipo() != TipoOperacion.NOTIF_CANCELACION && !ids.add(t.solicitudId())) {
                 return "solicitud_id repetido: " + t.solicitudId();
             }
             int numCliente = Integer.parseInt(t.clienteId().substring(1));
@@ -191,12 +215,19 @@ public class ValidacionGeneradorMain {
             if (t.latenciaMs() < 0) {
                 return "latencia negativa en línea " + (i + 1);
             }
-            boolean esReserva = t.tipo() == TipoOperacion.RESERVA;
-            if (esReserva != (t.evento() != null && t.ocurrencia() != null && t.cantidad() != null)) {
+            boolean esConsulta = t.tipo() == TipoOperacion.CONSULTA;
+            if (esConsulta == (t.evento() != null && t.ocurrencia() != null && t.cantidad() != null)) {
                 return "evento/ocurrencia/cantidad incoherentes con la operación en línea " + (i + 1);
             }
-            if (esReserva && (t.cantidad() < cfg.asientosMin || t.cantidad() > cfg.asientosMax)) {
+            boolean pideAsientos = t.tipo() == TipoOperacion.RESERVA || t.tipo() == TipoOperacion.MODIFICACION;
+            if (pideAsientos && (t.cantidad() < cfg.asientosMin || t.cantidad() > cfg.asientosMax)) {
                 return "cantidad fuera de rango en línea " + (i + 1);
+            }
+            boolean requiereId = (t.tipo() == TipoOperacion.RESERVA && t.estado() == EstadoTransaccion.OK)
+                    || t.tipo() == TipoOperacion.MODIFICACION || t.tipo() == TipoOperacion.CANCELACION
+                    || t.tipo() == TipoOperacion.NOTIF_CANCELACION;
+            if (cfg.usaIdSol() && requiereId && t.idReserva() == null) {
+                return "falta id_reserva en línea " + (i + 1);
             }
             if (t.tipo() == TipoOperacion.CONSULTA && t.estado() == EstadoTransaccion.RECHAZADO) {
                 return "una consulta no puede ser RECHAZADO (línea " + (i + 1) + ")";
@@ -222,8 +253,12 @@ public class ValidacionGeneradorMain {
             c.conteo().forEach((tipo, porEstado) ->
                     porEstado.forEach((estado, n) -> suma.get(tipo).merge(estado, n, Long::sum)));
         }
-        return igual(suma.get(TipoOperacion.CONSULTA), m.consulta())
-                && igual(suma.get(TipoOperacion.RESERVA), m.reserva());
+        for (TipoOperacion t : TipoOperacion.values()) {
+            if (t != TipoOperacion.NOTIF_CANCELACION && !igual(suma.get(t), m.de(t))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static boolean igual(Map<EstadoTransaccion, Long> c, AnalizadorMetricas.Estadistica e) {

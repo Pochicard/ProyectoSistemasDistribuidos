@@ -1,29 +1,21 @@
 package cliente;
 
 /**
- * Resultado de negocio de una solicitud RESERVA que SÍ obtuvo respuesta del GT.
- * Los fallos técnicos (sin conexión, sin respuesta) no llegan aquí: se representan con
- * {@link ErrorComunicacionException}.
+ * Resultado de negocio de una reserva o modificación que obtuvo respuesta del GT.
+ * Los fallos técnicos se representan con {@link ErrorComunicacionException}.
  */
 public enum ResultadoReserva {
 
-    /** El servidor respondió "OK": los asientos se descontaron. */
+    /** "OK" u "OK:&lt;idReserva&gt;": la operación se aplicó. */
     EXITOSA,
 
-    /**
-     * El servidor respondió "RECHAZADO". Con el backend actual significa cualquiera de:
-     * no hay asientos suficientes, el evento no existe o la ocurrencia no existe.
-     * El protocolo no permite distinguir entre estos casos.
-     */
+    /** "RECHAZADO": sin cupo, reserva inexistente o cancelada, u ocurrencia inexistente. */
     RECHAZADA;
 
-    /**
-     * Traduce la respuesta textual del servidor.
-     *
-     * @throws ErrorComunicacionException RESPUESTA_INVALIDA si es "ERROR..." o un texto desconocido
-     */
+    // Traduce la respuesta del servidor; "ERROR..." o un texto desconocido es RESPUESTA_INVALIDA.
     public static ResultadoReserva desde(String respuesta) throws ErrorComunicacionException {
-        if (ProtocoloSrb.RESPUESTA_OK.equals(respuesta)) {
+        if (ProtocoloSrb.RESPUESTA_OK.equals(respuesta)
+                || (respuesta != null && respuesta.startsWith(ProtocoloSrb.RESPUESTA_OK + ProtocoloSrb.SEPARADOR))) {
             return EXITOSA;
         }
         if (ProtocoloSrb.RESPUESTA_RECHAZADO.equals(respuesta)) {
@@ -34,6 +26,6 @@ public enum ResultadoReserva {
                     "El servidor devolvió un error: " + respuesta);
         }
         throw new ErrorComunicacionException(ErrorComunicacionException.Tipo.RESPUESTA_INVALIDA,
-                "Respuesta inesperada a una reserva: \"" + respuesta + "\"");
+                "Respuesta inesperada: \"" + respuesta + "\"");
     }
 }

@@ -7,22 +7,9 @@ import java.time.format.DateTimeFormatter;
 import java.util.Locale;
 
 /**
- * Registro de una solicitud enviada por un cliente simulado; corresponde a una fila del CSV.
- *
- * <p>Las cinco primeras columnas son las requeridas por el proyecto:</p>
- * <pre>
- * timestamp,cliente_id,tipo_operacion,latencia_ms,estado,solicitud_id,perfil,evento,ocurrencia,cantidad
- * 2026-10-11T15:31:05.123-05:00,C03,RESERVA,4.217,OK,57,MIXTO,E12,2,1
- * </pre>
- * <p>Ningún campo contiene comas, por lo que no se usan comillas.</p>
- *
- * @param solicitudId identificador único de la solicitud dentro de la prueba
- * @param timestamp   instante de envío
- * @param latenciaMs  tiempo entre el envío y la recepción de la respuesta, medido con
- *                    {@code System.nanoTime()}; en los errores, tiempo hasta detectar el fallo
- * @param evento      evento reservado (null en consultas)
- * @param ocurrencia  ocurrencia reservada (null en consultas)
- * @param cantidad    asientos solicitados (null en consultas)
+ * Una fila del CSV. Las cinco primeras columnas son las requeridas por el proyecto; la latencia se mide con
+ * {@code System.nanoTime()} y la marca temporal con {@code Instant.now()}. Los campos de la reserva quedan
+ * vacíos en las consultas.
  */
 public record RegistroTransaccion(long solicitudId,
                                   Instant timestamp,
@@ -33,9 +20,14 @@ public record RegistroTransaccion(long solicitudId,
                                   EstadoTransaccion estado,
                                   String evento,
                                   Integer ocurrencia,
-                                  Integer cantidad) {
+                                  Integer cantidad,
+                                  Long idReserva) {
 
-    public static final String ENCABEZADO =
+    public static final String ENCABEZADO = "timestamp,cliente_id,tipo_operacion,latencia_ms,estado,"
+            + "solicitud_id,perfil,evento,ocurrencia,cantidad,id_reserva";
+
+    /** Encabezado de los CSV de la primera entrega (sin id_reserva); se siguen pudiendo leer. */
+    public static final String ENCABEZADO_V1 =
             "timestamp,cliente_id,tipo_operacion,latencia_ms,estado,solicitud_id,perfil,evento,ocurrencia,cantidad";
 
     /** Encabezado del CSV para Excel en español (separador ';'). */
@@ -58,7 +50,8 @@ public record RegistroTransaccion(long solicitudId,
                 perfil.name(),
                 vacioSiNulo(evento),
                 vacioSiNulo(ocurrencia),
-                vacioSiNulo(cantidad));
+                vacioSiNulo(cantidad),
+                vacioSiNulo(idReserva));
     }
 
     /** Fila del CSV para Excel en español: separador ';' y coma decimal. */
@@ -73,14 +66,15 @@ public record RegistroTransaccion(long solicitudId,
                 perfil.name(),
                 vacioSiNulo(evento),
                 vacioSiNulo(ocurrencia),
-                vacioSiNulo(cantidad));
+                vacioSiNulo(cantidad),
+                vacioSiNulo(idReserva));
     }
 
     /** Construye un registro a partir de una fila del CSV estándar. */
     public static RegistroTransaccion desdeCsv(String linea) {
         String[] c = linea.split(",", -1);
-        if (c.length != 10) {
-            throw new IllegalArgumentException("Se esperaban 10 columnas y hay " + c.length + ": " + linea);
+        if (c.length != 10 && c.length != 11) {
+            throw new IllegalArgumentException("Se esperaban 10 u 11 columnas y hay " + c.length + ": " + linea);
         }
         return new RegistroTransaccion(
                 Long.parseLong(c[5]),
@@ -92,7 +86,8 @@ public record RegistroTransaccion(long solicitudId,
                 EstadoTransaccion.valueOf(c[4]),
                 c[7].isEmpty() ? null : c[7],
                 c[8].isEmpty() ? null : Integer.valueOf(c[8]),
-                c[9].isEmpty() ? null : Integer.valueOf(c[9]));
+                c[9].isEmpty() ? null : Integer.valueOf(c[9]),
+                c.length < 11 || c[10].isEmpty() ? null : Long.valueOf(c[10]));
     }
 
     /** Instante de finalización de la solicitud (envío + latencia). */

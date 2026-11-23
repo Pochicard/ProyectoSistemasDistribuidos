@@ -4,6 +4,7 @@ import cliente.ConexionGt;
 import cliente.ErrorComunicacionException;
 import cliente.EventoDto;
 import cliente.ProtocoloSrb;
+import cliente.ReceptorNotificaciones;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -30,15 +31,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Coordina la ejecución de una prueba de carga:
- * <ol>
- *   <li>Consulta inicial: verifica el GT, obtiene las ocurrencias y la disponibilidad inicial.</li>
- *   <li>Crea un {@code ExecutorService} con un hilo por {@link ClienteSimulado}.</li>
- *   <li>Inicia todos los clientes simultáneamente cuando sus sockets están listos.</li>
- *   <li>Espera su finalización y cierra el ejecutor y el escritor CSV.</li>
- *   <li>Consulta final y verificación de consistencia de asientos.</li>
- *   <li>Cálculo de métricas a partir del CSV y escritura del resumen.</li>
- * </ol>
+ * Coordina una prueba: consulta inicial, un hilo por cliente con arranque simultáneo, espera de las
+ * notificaciones pendientes, consulta final con verificación de consistencia y métricas desde el CSV.
  */
 public final class GeneradorCarga {
 
@@ -51,7 +45,8 @@ public final class GeneradorCarga {
     /** Resultado de una ejecución, usado por el programa principal y por la validación. */
     public record ResultadoEjecucion(ConfiguracionCarga cfg, Path csv, Path csvExcel, Path resumen,
                                      List<ClienteSimulado.Resumen> clientes, List<String> fallosClientes,
-                                     long registrosEscritos, IOException errorEscritura,
+                                     long registrosEscritos, long notificacionesRegistradas,
+                                     IOException errorEscritura,
                                      AnalizadorMetricas.Resultado metricas, double duracionRealSeg,
                                      boolean ejecutorTerminado, boolean escritorTerminado,
                                      int conexionesAbiertasAlFinal, Consistencia consistencia,
@@ -59,7 +54,8 @@ public final class GeneradorCarga {
     }
 
     private static final DateTimeFormatter SELLO = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
-    private static final String ACUMULADO = "resumen-escenarios_excel.csv";
+    /** Resumen acumulado con columnas de la segunda entrega (percentiles 99/99,9 y disponibilidad). */
+    static final String ACUMULADO = "resumen-escenarios-v2_excel.csv";
 
     private final PrintStream salida;
 
@@ -67,12 +63,7 @@ public final class GeneradorCarga {
         this.salida = salida;
     }
 
-    /**
-     * Ejecuta la prueba.
-     *
-     * @param detener indicador de detención anticipada (Ctrl+C), consultado periódicamente por los clientes
-     * @throws IllegalStateException si el GT no responde a la consulta inicial
-     */
+    // Ejecuta la prueba. "detener" se activa con Ctrl+C y los clientes lo revisan periódicamente.
     public ResultadoEjecucion ejecutar(ConfiguracionCarga cfg, AtomicBoolean detener)
             throws IOException, InterruptedException {
         cfg.validar();
@@ -81,7 +72,7 @@ public final class GeneradorCarga {
         salida.println("==========================================================");
 
         // Conexión del hilo principal, usada solo para las consultas inicial y final.
-        try (ConexionGt conexionControl = new ConexionGt(cfg.host, cfg.puerto, cfg.timeoutMs)) {
+        try (ConexionGt conexionControl = new ConexionGt(cfg.gts, cfg.timeoutMs)) {
 
             // Consulta inicial
             Map<String, EventoDto> catalogoInicial = consultarCatalogo(conexionControl, "inicial");
@@ -96,6 +87,8 @@ public final class GeneradorCarga {
             }
             salida.printf(Locale.ROOT, "[Generador] Catálogo inicial: %d eventos, %d ocurrencias, %d asientos disponibles%n",
                     catalogoInicial.size(), todas.size(), totalAsientos(catalogoInicial));
+            Map<String, Integer> ocurrenciasPorEvento = new HashMap<>();
+            catalogoInicial.values().forEach(e -> ocurrenciasPorEvento.put(e.getId(), e.getOcurrencias()));
 
             // Archivos de salida con nombre único para no sobrescribir pruebas anteriores
             Files.createDirectories(cfg.carpetaSalida);
@@ -109,16 +102,28 @@ public final class GeneradorCarga {
             AtomicInteger conexionesAbiertas = new AtomicInteger();
             boolean ejecutorTerminado;
             double duracionReal;
+            RegistroReservas registro = new RegistroReservas();
+            AtomicLong notificaciones = new AtomicLong();
             EscritorCsv escritor = new EscritorCsv(csv, csvExcel);
+            ReceptorNotificaciones receptor = null;
             try {
+                if (cfg.pctCancelacion > 0) {
+                    // Un único receptor PULL para todo el generador; cada notificación trae su idReserva.
+                    receptor = new ReceptorNotificaciones(cfg.puertoNotif, (n, texto) -> {
+                        if (n != null) {
+                            registrarNotificacion(registro, escritor, notificaciones, n.idReserva(),
+                                    n.cancelada() ? EstadoTransaccion.OK : EstadoTransaccion.RECHAZADO);
+                        }
+                    });
+                }
                 // Un hilo por cliente
                 ExecutorService ejecutor = Executors.newFixedThreadPool(cfg.clientes, fabricaDeHilos());
                 ClienteSimulado.Arranque arranque = new ClienteSimulado.Arranque(cfg.clientes);
                 AtomicLong secuencia = new AtomicLong();
                 List<Future<ClienteSimulado.Resumen>> futuros = new ArrayList<>();
                 for (int i = 1; i <= cfg.clientes; i++) {
-                    futuros.add(ejecutor.submit(new ClienteSimulado(i, cfg, destinos, escritor, arranque,
-                            secuencia, conexionesAbiertas, detener)));
+                    futuros.add(ejecutor.submit(new ClienteSimulado(i, cfg, destinos, ocurrenciasPorEvento,
+                            escritor, registro, arranque, secuencia, conexionesAbiertas, detener)));
                 }
 
                 // Arranque simultáneo una vez que todos los clientes tienen su socket
@@ -157,12 +162,16 @@ public final class GeneradorCarga {
                         fallos.add("Un cliente fue cancelado");
                     }
                 }
+                esperarNotificaciones(cfg, registro, escritor, notificaciones);
             } finally {
+                if (receptor != null) {
+                    receptor.close();
+                }
                 escritor.close(); // escribe los registros pendientes y cierra los archivos
             }
 
             // Consulta final y verificación de consistencia
-            Consistencia consistencia = verificarConsistencia(conexionControl, catalogoInicial, csv);
+            Consistencia consistencia = verificarConsistencia(cfg, conexionControl, catalogoInicial, csv, registro);
 
             // Métricas calculadas desde el CSV
             AnalizadorMetricas.Resultado metricas =
@@ -177,23 +186,68 @@ public final class GeneradorCarga {
             salida.print(texto);
 
             return new ResultadoEjecucion(cfg, csv, csvExcel, resumen, resumenes, fallos,
-                    escritor.getEscritos(), escritor.getError(), metricas, duracionReal,
+                    escritor.getEscritos(), notificaciones.get(), escritor.getError(), metricas, duracionReal,
                     ejecutorTerminado, escritor.hiloTerminado(), conexionesAbiertas.get(),
                     consistencia, detener.get(), texto);
         }
     }
 
+    /** Registra la llegada de una notificación como fila NOTIF_CANCELACION y actualiza la reserva. */
+    private static void registrarNotificacion(RegistroReservas registro, EscritorCsv escritor, AtomicLong contador,
+                                              long idReserva, EstadoTransaccion estado) {
+        RegistroReservas.CancelacionPendiente p = registro.retirarCancelacionPendiente(idReserva);
+        if (p == null) {
+            return; // notificación de una reserva que no es de esta prueba
+        }
+        RegistroReservas.Reserva r = registro.obtener(idReserva);
+        if (r != null && estado != EstadoTransaccion.SIN_RESPUESTA) {
+            r.estado = estado == EstadoTransaccion.OK ? RegistroReservas.Estado.CANCELADA : RegistroReservas.Estado.ACTIVA;
+        }
+        escritor.registrar(new RegistroTransaccion(p.solicitudId(), p.marca(), p.clienteId(), p.perfil(),
+                TipoOperacion.NOTIF_CANCELACION, (System.nanoTime() - p.envioNanos()) / 1_000_000.0, estado,
+                p.evento(), p.ocurrencia(), p.cantidad(), idReserva));
+        contador.incrementAndGet();
+    }
+
+    /**
+     * Espera las notificaciones de cancelación pendientes; las que no llegan a tiempo se registran como
+     * SIN_RESPUESTA (la reserva queda en estado incierto).
+     */
+    private void esperarNotificaciones(ConfiguracionCarga cfg, RegistroReservas registro, EscritorCsv escritor,
+                                       AtomicLong contador) throws InterruptedException {
+        long limite = System.nanoTime() + cfg.esperaNotificacionesSeg * 1_000_000_000L;
+        while (!registro.pendientes().isEmpty() && System.nanoTime() < limite) {
+            TimeUnit.MILLISECONDS.sleep(100);
+        }
+        if (!registro.pendientes().isEmpty()) {
+            salida.println("[Generador] " + registro.pendientes().size()
+                    + " notificación(es) de cancelación no llegaron a tiempo.");
+            for (Long id : new ArrayList<>(registro.pendientes().keySet())) {
+                registrarNotificacion(registro, escritor, contador, id, EstadoTransaccion.SIN_RESPUESTA);
+            }
+        }
+    }
+
     private Map<String, EventoDto> consultarCatalogo(ConexionGt conexion, String momento) {
         try {
-            return ProtocoloSrb.parsearConsulta(conexion.enviar(ProtocoloSrb.CONSULTA));
+            // Formato simple, aceptado por la arquitectura base y la escalable. La consulta de control sí
+            // reintenta (pasa al otro GT si hay dos) porque es idempotente.
+            return ProtocoloSrb.parsearConsulta(conexion.enviarConReintentos(ProtocoloSrb.CONSULTA,
+                    conexion.getEndpoints().size() + 1, null));
         } catch (ErrorComunicacionException e) {
             throw new IllegalStateException("La consulta " + momento + " al GT falló [" + e.getTipo() + "]: "
                     + e.getMessage() + " ¿Están en ejecución Persistencia, RMC y GT?", e);
         }
     }
 
-    private Consistencia verificarConsistencia(ConexionGt conexion, Map<String, EventoDto> inicial, Path csv)
-            throws IOException {
+    /**
+     * Compara, por ocurrencia, los asientos que bajó la disponibilidad con los que deberían estar ocupados.
+     * Con protocolo v2 lo esperado sale del registro de reservas (incluye modificaciones y cancelaciones);
+     * con v1, de la suma de reservas OK del CSV.
+     */
+    private Consistencia verificarConsistencia(ConfiguracionCarga cfg, ConexionGt conexion,
+                                               Map<String, EventoDto> inicial, Path csv,
+                                               RegistroReservas registro) throws IOException {
         Map<String, EventoDto> finalCat;
         try {
             finalCat = consultarCatalogo(conexion, "final");
@@ -204,14 +258,18 @@ public final class GeneradorCarga {
         Map<String, Long> reservadoOk = new HashMap<>();
         long inciertas = 0;
         for (RegistroTransaccion r : AnalizadorMetricas.leerCsv(csv)) {
-            if (r.tipo() != TipoOperacion.RESERVA) {
+            if (r.tipo() == TipoOperacion.CONSULTA) {
                 continue;
             }
-            if (r.estado() == EstadoTransaccion.OK) {
-                reservadoOk.merge(r.evento() + ":" + r.ocurrencia(), (long) r.cantidad(), Long::sum);
-            } else if (r.estado() == EstadoTransaccion.SIN_RESPUESTA) {
-                inciertas++;
+            if (r.estado() == EstadoTransaccion.SIN_RESPUESTA) {
+                inciertas++; // pudo aplicarse o no
             }
+            if (!cfg.usaIdSol() && r.tipo() == TipoOperacion.RESERVA && r.estado() == EstadoTransaccion.OK) {
+                reservadoOk.merge(r.evento() + ":" + r.ocurrencia(), (long) r.cantidad(), Long::sum);
+            }
+        }
+        if (cfg.usaIdSol()) {
+            reservadoOk = registro.asientosOcupadosPorOcurrencia();
         }
         List<String> discrepancias = new ArrayList<>();
         boolean negativos = false;
@@ -236,7 +294,7 @@ public final class GeneradorCarga {
                     discrepancias.add(clave + " quedó con disponibilidad negativa: " + f.getDisponibles(o));
                 }
                 if (descontado != esperado) {
-                    discrepancias.add(String.format("%s: inicial %d, final %d (bajó %d) pero las reservas OK suman %d",
+                    discrepancias.add(String.format("%s: inicial %d, final %d (bajó %d) pero las reservas activas suman %d",
                             clave, e.getDisponibles(o), f.getDisponibles(o), descontado, esperado));
                 }
             }
@@ -268,14 +326,13 @@ public final class GeneradorCarga {
         double esperadasPorCliente = cfg.duracionSeg * cfg.rpm / 60.0;
         sb.append(String.format(Locale.ROOT, "Clientes (esperado ~%.0f solicitudes c/u = %d por minuto):%n",
                 esperadasPorCliente, cfg.rpm));
-        sb.append(String.format(Locale.ROOT, "  %-5s %-14s %-12s %9s %8s %9s %9s%n",
-                "Id", "Perfil", "Hilo", "Enviadas", "Por min", "Consultas", "Reservas"));
+        sb.append(String.format(Locale.ROOT, "  %-5s %-14s %-10s %8s %7s %9s %8s %8s %8s%n",
+                "Id", "Perfil", "Hilo", "Enviadas", "Por min", "Consultas", "Reservas", "Modific.", "Cancel."));
         for (ClienteSimulado.Resumen r : clientes) {
-            long consultas = r.conteo().get(TipoOperacion.CONSULTA).values().stream().mapToLong(Long::longValue).sum();
-            long reservas = r.conteo().get(TipoOperacion.RESERVA).values().stream().mapToLong(Long::longValue).sum();
-            sb.append(String.format(Locale.ROOT, "  %-5s %-14s %-12s %9d %8.1f %9d %9d%n",
-                    r.clienteId(), r.perfil(), r.hilo(), r.enviadas(),
-                    r.enviadas() / (cfg.duracionSeg / 60.0), consultas, reservas));
+            sb.append(String.format(Locale.ROOT, "  %-5s %-14s %-10s %8d %7.1f %9d %8d %8d %8d%n",
+                    r.clienteId(), r.perfil(), r.hilo(), r.enviadas(), r.enviadas() / (cfg.duracionSeg / 60.0),
+                    total(r, TipoOperacion.CONSULTA), total(r, TipoOperacion.RESERVA),
+                    total(r, TipoOperacion.MODIFICACION), total(r, TipoOperacion.CANCELACION)));
         }
         for (String f : fallos) {
             sb.append("  AVISO: ").append(f).append('\n');
@@ -283,17 +340,17 @@ public final class GeneradorCarga {
         sb.append('\n');
         sb.append(AnalizadorMetricas.formatear(m));
         sb.append('\n');
-        sb.append("Consistencia de asientos (disponibilidad inicial - final = reservas OK):\n");
+        sb.append("Consistencia de asientos (disponibilidad inicial - final = asientos de las reservas activas):\n");
         if (!c.verificada()) {
             sb.append("  No verificada: ").append(String.join("; ", c.discrepancias())).append('\n');
         } else {
             sb.append(String.format(Locale.ROOT,
-                    "  %s - %d ocurrencias revisadas, asientos reservados OK: %d, asientos descontados en el servidor: %d%n",
+                    "  %s - %d ocurrencias revisadas, asientos en reservas activas: %d, descontados en el servidor: %d%n",
                     c.correcta() ? "CORRECTA" : "CON DIFERENCIAS", c.ocurrenciasRevisadas(),
                     c.asientosReservadosOk(), c.asientosDescontados()));
             sb.append("  Disponibilidad negativa: ").append(c.hayNegativos() ? "SÍ" : "no").append('\n');
             if (c.reservasInciertas() > 0) {
-                sb.append("  Reservas sin respuesta (pudieron aplicarse o no): ").append(c.reservasInciertas()).append('\n');
+                sb.append("  Operaciones sin respuesta (pudieron aplicarse o no): ").append(c.reservasInciertas()).append('\n');
             }
             for (String d : c.discrepancias()) {
                 sb.append("  - ").append(d).append('\n');
@@ -305,7 +362,11 @@ public final class GeneradorCarga {
         return sb.toString();
     }
 
-    /** Agrega las filas CONSULTA, RESERVA y TOTAL de la prueba al resumen acumulado. */
+    private static long total(ClienteSimulado.Resumen r, TipoOperacion tipo) {
+        return r.conteo().get(tipo).values().stream().mapToLong(Long::longValue).sum();
+    }
+
+    /** Agrega una fila por tipo de operación, más el total, al resumen acumulado de todas las pruebas. */
     private void agregarAlAcumulado(ConfiguracionCarga cfg, Path csv, AnalizadorMetricas.Resultado m,
                                     Consistencia c, boolean interrumpida) throws IOException {
         Path acumulado = cfg.carpetaSalida.resolve(ACUMULADO);
@@ -313,20 +374,26 @@ public final class GeneradorCarga {
         try (BufferedWriter w = Files.newBufferedWriter(acumulado, StandardCharsets.UTF_8,
                 StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
             if (nuevo) {
-                w.write('﻿');
-                w.write("fecha;escenario;clientes;solo_consulta;mixtos;duracion_s;rpm_cliente;pct_reserva;"
-                        + "operacion;enviadas;respondidas;ok;rechazadas;errores_tecnicos;promedio_ms;"
-                        + "desviacion_ms;p95_ms;tpm;ventana_s;consistencia;interrumpida;archivo_csv");
+                w.write('\uFEFF'); // BOM para que Excel detecte UTF-8
+                w.write("fecha;escenario;gt;protocolo;clientes;solo_consulta;mixtos;duracion_s;rpm_cliente;"
+                        + "pct_reserva;pct_modificacion;pct_cancelacion;operacion;enviadas;respondidas;ok;rechazadas;"
+                        + "errores_tecnicos;disponibilidad_pct;promedio_ms;desviacion_ms;p95_ms;p99_ms;p999_ms;tpm;"
+                        + "ventana_s;consistencia;interrumpida;archivo_csv");
                 w.newLine();
             }
             String fecha = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
-            for (AnalizadorMetricas.Estadistica e : List.of(m.consulta(), m.reserva(), m.total())) {
-                w.write(String.join(";", fecha, cfg.nombre, Integer.toString(cfg.clientes),
-                        Integer.toString(cfg.soloConsulta), Integer.toString(cfg.clientesMixtos()),
-                        Integer.toString(cfg.duracionSeg), Integer.toString(cfg.rpm), Integer.toString(cfg.pctReserva),
+            List<AnalizadorMetricas.Estadistica> filas = new ArrayList<>(m.porTipo().values());
+            filas.add(m.total());
+            for (AnalizadorMetricas.Estadistica e : filas) {
+                w.write(String.join(";", fecha, cfg.nombre, String.join(" ", cfg.gts), cfg.protocolo,
+                        Integer.toString(cfg.clientes), Integer.toString(cfg.soloConsulta),
+                        Integer.toString(cfg.clientesMixtos()), Integer.toString(cfg.duracionSeg),
+                        Integer.toString(cfg.rpm), Integer.toString(cfg.pctReserva),
+                        Integer.toString(cfg.pctModificacion), Integer.toString(cfg.pctCancelacion),
                         e.operacion(), Long.toString(e.enviadas()), Long.toString(e.respondidas()),
                         Long.toString(e.ok()), Long.toString(e.rechazadas()), Long.toString(e.erroresTecnicos()),
-                        decimal(e.promedioMs()), decimal(e.desviacionMs()), decimal(e.p95Ms()), decimal(e.tpm()),
+                        decimal(e.disponibilidadPct()), decimal(e.promedioMs()), decimal(e.desviacionMs()),
+                        decimal(e.p95Ms()), decimal(e.p99Ms()), decimal(e.p999Ms()), decimal(e.tpm()),
                         decimal(m.ventanaSeg()),
                         !c.verificada() ? "NO_VERIFICADA" : (c.correcta() ? "CORRECTA" : "CON_DIFERENCIAS"),
                         interrumpida ? "SI" : "NO", csv.getFileName().toString()));
