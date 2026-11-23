@@ -3,18 +3,53 @@
 Santiago Martínez y Germán Rodríguez — Pontificia Universidad Javeriana, 2026-30
 
 Arquitectura de tres capas comunicada con ZeroMQ (JeroMQ 0.5.4), Java 17, base de datos SQLite.
+Versión final: escalable (varios RMC, Persistencia multihilo) y tolerante a fallas (GT en par
+Binary Star, reenvío automático si cae un RMC, operaciones idempotentes).
+
+## 1. Arquitectura final
 
 ```
- MÁQUINA 1 (consumidores)      MÁQUINA 2 (negocio)                 MÁQUINA 3 (almacenamiento)
- ┌───────────────────────┐     ┌──────────────┐   ┌─────────┐      ┌──────────────────────────┐
- │ ClienteMain           │REQ  │ GT           │REQ│ RMC     │ REQ  │ Persistencia             │
- │ GeneradorCargaMain    │────▶│ REP :5555    │──▶│REP :5556│─────▶│ REP :5557                │
- │                       │◀────│              │◀──│         │◀─────│ datos/srb.db (SQLite)    │
- └───────────────────────┘     └──────────────┘   └─────────┘      │                          │
-                                                                    └──────────────────────────┘
+ MÁQUINA 1 (consumidores)        MÁQUINA 2 (negocio, 192.168.56.101)                     MÁQUINA 3 (almacenamiento, 192.168.56.102)
+
+ Cliente / Generador  REQ ──┬──▶ GT primario  ROUTER :5555 ─┐ DEALER ──▶ RMC 1  REP :5556 ─┐ REQ
+   (Lazy Pirate:            │      PUB :5003 ⇄ SUB          ├────────▶ RMC 2  REP :5566 ─┼────▶ Persistencia ROUTER :5557
+    timeout y cambio de GT) │                 heartbeats     │                            │       proxy ⇄ N hilos (REP)
+                            └──▶ GT respaldo  ROUTER :5565 ─┘                            │       SQLite datos/srb.db
+                                   PUB :5004 ⇄ SUB                                        │
+                                       │ PUSH                                             │
+                                       ▼                                                  │
+                                 Servicio de Cancelaciones  PULL :5558 ── REQ (LIBERAR) ──┘
+                                       │ PUSH  NOTIF:<idReserva>:CANCELADA
+ Cliente  PULL :6001  ◀────────────────┘
 ```
 
-## 1. Compilar (una sola vez)
+| Componente | Máquina | Puerto | Sockets | Patrón |
+|---|---|---|---|---|
+| Cliente / generador de carga | 1 | 6001+ (notificaciones) | REQ, PULL | Request/Reply + Lazy Pirate; recibe notificaciones |
+| GT primario | 2 | 5555, 5003 | ROUTER, DEALER, PUSH, PUB, SUB | Request/Reply, Pipeline, Binary Star |
+| GT respaldo | 2 | 5565, 5004 | ROUTER, DEALER, PUSH, PUB, SUB | Igual; pasivo hasta que falla el primario |
+| RMC 1 y RMC 2 | 2 | 5556, 5566 | REP, REQ | Request/Reply |
+| Servicio de Cancelaciones | 2 | 5558 | PULL, REQ, PUSH | Pipeline (asíncrono) |
+| Persistencia | 3 | 5557 | ROUTER, DEALER inproc, REP | Servidor multihilo (proxy) |
+
+### Escalabilidad
+- **Varios RMC**: el GT usa un DEALER por RMC (asíncrono) y envía cada solicitud al RMC con menos
+  trabajo en curso. Agregar un RMC = arrancar otro proceso y añadirlo en `--rmc`.
+- **GT asíncrono**: con ROUTER atiende muchas solicitudes a la vez, en lugar de una por una.
+- **Persistencia multihilo**: un ROUTER reparte las solicitudes entre `--hilos` trabajadores, cada uno con
+  su conexión a SQLite (modo WAL: las consultas corren en paralelo; las escrituras se ordenan).
+
+### Tolerancia a fallas
+- **Falla del GT — Binary Star**: dos GT intercambian heartbeats cada 1 s. Si el activo deja de
+  enviarlos por 2 s y llega una solicitud, el pasivo toma el control (failover). Si el caído vuelve,
+  queda como pasivo. El cliente, si no recibe respuesta, reintenta la misma solicitud en el otro GT.
+- **Falla de un RMC**: si un RMC no responde en 2 s, el GT reenvía sus solicitudes pendientes a otro
+  RMC; el cliente no se entera. Cuando el RMC vuelve, se usa de nuevo.
+- **Continuar donde quedó, sin duplicar**: cada operación lleva un `idSol` único. La Persistencia lo
+  guarda en la tabla `solicitud` en la misma transacción que el cambio; un reintento recibe la
+  respuesta guardada y no se aplica dos veces.
+
+## 2. Compilar
 
 Requisitos: JDK 17+ y Maven 3.8+.
 
@@ -22,126 +57,99 @@ Requisitos: JDK 17+ y Maven 3.8+.
 mvn clean package
 ```
 
-Se genera **`target/srb.jar`** con JeroMQ, Gson y el driver de SQLite incluidos. Copie ese único archivo a las tres máquinas.
+Genera **`target/srb.jar`** con JeroMQ, Gson y el driver de SQLite incluidos. Copie ese archivo a las máquinas 2 y 3:
 
-## 2. Ejecutar en TRES máquinas
-
-Ejemplo con estas IP (cámbielas por las reales; en Linux `hostname -I`, en Windows `ipconfig`):
-
-| Máquina | Capa | IP de ejemplo | Procesos | Puertos que debe abrir |
-|---|---|---|---|---|
-| 1 | Consumidores | 10.43.100.11 | Clientes / generador de carga | — |
-| 2 | Negocio | 10.43.100.12 | GT y RMC | 5555 (y 5556 si el RMC va en otra máquina) |
-| 3 | Almacenamiento | 10.43.100.13 | Persistencia | 5557 |
-
-Arranque en este orden (de abajo hacia arriba):
-
-```bash
-# MÁQUINA 3 — Persistencia (imprime el estado inicial de la BD)
-java -cp srb.jar persistencia.PersistenciaMain --puerto=5557 --datos=./datos --reiniciar
-
-# MÁQUINA 2 — RMC y GT (dos terminales)
-java -cp srb.jar rmc.RmcMain --puerto=5556 --persistencia=10.43.100.13:5557
-java -cp srb.jar gt.GtMain   --puerto=5555 --rmc=localhost:5556
-
-# MÁQUINA 1 — Cliente interactivo o generador de carga
-java -cp srb.jar cliente.ClienteMain --gt=10.43.100.12:5555
-java -cp srb.jar pruebas.GeneradorCargaMain --escenario=A --gt=10.43.100.12:5555
+```powershell
+scp target\srb.jar srb@192.168.56.101:~
+scp target\srb.jar srb@192.168.56.102:~
 ```
 
-Ninguna IP está escrita en el código: cada servicio recibe la dirección de la capa siguiente por argumento
-(o por variable de entorno: `SRB_RMC`, `SRB_PERSISTENCIA`, `SRB_PUERTO`, `SRB_DATOS`).
-
-**Firewall.** Si un servicio no conecta, abra el puerto en la máquina que hace `bind`:
-- Linux (ufw): `sudo ufw allow 5557/tcp`
-- Windows: `netsh advfirewall firewall add rule name="SRB" dir=in action=allow protocol=TCP localport=5555-5557`
-
-Comprobación rápida desde otra máquina: `nc -zv 10.43.100.13 5557` (Linux) o `Test-NetConnection 10.43.100.13 -Port 5557` (PowerShell).
-
-### Despliegue usado: 1 equipo anfitrión + 2 máquinas virtuales (VirtualBox)
-
-| Máquina | Dónde | Red | IP | Procesos |
-|---|---|---|---|---|
-| 1 Consumidores | Equipo anfitrión | Host-only (vboxnet0) | 192.168.56.1 | Clientes / generador de carga |
-| 2 Negocio | VM `srb-negocio` (Ubuntu Server) | NAT + Host-only | 192.168.56.101 | GT y RMC |
-| 3 Almacenamiento | VM `srb-datos` (Ubuntu Server) | NAT + Host-only | 192.168.56.102 | Persistencia |
-
-Cada VM tiene dos adaptadores: **NAT** (salida a internet para instalar Java) y **Red solo-anfitrión**
-(comunicación entre el anfitrión y las VM, con IP fijas). La red solo-anfitrión no depende del Wi-Fi, así que
-funciona igual en la universidad.
+## 3. Ejecutar en tres máquinas (en este orden)
 
 ```bash
-# VM srb-datos (192.168.56.102)
-java -cp srb.jar persistencia.PersistenciaMain --puerto=5557 --reiniciar
-# VM srb-negocio (192.168.56.101), dos terminales
+# MÁQUINA 3 (srb-datos) — Persistencia. --reiniciar vuelve a los 50 eventos con 100 asientos.
+java -cp srb.jar persistencia.PersistenciaMain --puerto=5557 --hilos=4 --reiniciar
+
+# MÁQUINA 2 (srb-negocio) — una terminal por proceso
 java -cp srb.jar rmc.RmcMain --puerto=5556 --persistencia=192.168.56.102:5557
-java -cp srb.jar gt.GtMain   --puerto=5555 --rmc=localhost:5556
-# Anfitrión
-java -cp target/srb.jar cliente.ClienteMain --gt=192.168.56.101:5555
+java -cp srb.jar rmc.RmcMain --puerto=5566 --persistencia=192.168.56.102:5557
+java -cp srb.jar cancelaciones.CancelacionesMain --puerto=5558 --persistencia=192.168.56.102:5557
+java -cp srb.jar gt.GtMain --rol=primario --puerto=5555 --rmc=localhost:5556,localhost:5566
+java -cp srb.jar gt.GtMain --rol=respaldo --puerto=5565 --rmc=localhost:5556,localhost:5566
+
+# MÁQUINA 1 (Windows) — cliente o generador de carga
+java -cp target\srb.jar cliente.ClienteMain --gt=192.168.56.101:5555
+java -cp target\srb.jar pruebas.GeneradorCargaMain --escenario=A --gt=192.168.56.101:5555
 ```
 
-### Todo en una máquina (para desarrollo)
+Opciones útiles del GT: `--metricas=60` (imprime el TPM por tipo cada 60 s), `--timeout-rmc=2000`.
 
-Los valores por defecto apuntan a `localhost`, así que basta con:
+**En las pruebas de carga, arranque GT, RMC y Persistencia con `--silencioso`.** Imprimir una línea
+por solicitud en una ventana SSH frena a los propios procesos (con miles de solicitudes, la consola se
+vuelve el cuello de botella) y distorsiona las medidas. Para la demostración en la sustentación, sin
+`--silencioso` se ve cada operación.
+
+**Arquitectura base (para comparar en el informe):** un solo GT sin `--rol` y un solo RMC:
 
 ```bash
-java -cp target/srb.jar persistencia.PersistenciaMain
-java -cp target/srb.jar rmc.RmcMain
-java -cp target/srb.jar gt.GtMain
-java -cp target/srb.jar cliente.ClienteMain
+java -cp srb.jar persistencia.PersistenciaMain --puerto=5557 --hilos=1 --reiniciar
+java -cp srb.jar rmc.RmcMain --puerto=5556 --persistencia=192.168.56.102:5557
+java -cp srb.jar gt.GtMain --puerto=5555 --rmc=localhost:5556
 ```
 
-## 3. Persistencia: base de datos SQLite
+**Probar la tolerancia a fallas:** con el generador corriendo, Ctrl + C en el GT primario (el respaldo
+pasa a ACTIVE) o en un RMC (el GT reenvía al otro). En la Persistencia aparecen como
+`reintento: se devuelve la respuesta guardada` las solicitudes repetidas que no se aplicaron dos veces.
 
-El Servicio de Persistencia guarda los datos en una **base de datos SQLite**, el archivo `datos/srb.db`
-en la máquina 3. SQLite es un motor relacional embebido: el driver (`sqlite-jdbc`) viaja dentro de `srb.jar`,
-así que no hay que instalar un servidor de BD aparte.
+**Firewall de Windows:** las notificaciones de cancelación llegan del Servicio de Cancelaciones (VM) al
+cliente (Windows). La primera vez que el cliente abre su puerto, Windows pregunta si permite a Java:
+marque redes **privadas y públicas**. O, en PowerShell como administrador:
+`netsh advfirewall firewall add rule name="SRB notificaciones" dir=in action=allow protocol=TCP localport=6001-6020`
 
-Esquema:
+### Todo en una máquina (desarrollo)
 
-| Tabla | Columnas |
+Los valores por defecto usan `localhost`, así que basta con arrancar los procesos sin direcciones
+(`--persistencia`, `--rmc` y `--cancelaciones` por defecto apuntan a localhost).
+
+## 4. Protocolo de mensajes (texto UTF-8, una trama)
+
+Definido en `comun/Protocolo.java`. `idSol` = UUID que genera el cliente y repite en los reintentos.
+
+| Operación | El cliente envía | Respuesta |
+|---|---|---|
+| Consulta | `CONSULTA` o `CONSULTA:<idSol>` | JSON con los eventos |
+| Reserva | `RESERVA:<idSol>:<evento>:<ocurrencia>:<cantidad>` | `OK:<idReserva>` o `RECHAZADO` |
+| Reserva (formato 1.ª entrega) | `RESERVA:<evento>:<ocurrencia>:<cantidad>` | `OK` o `RECHAZADO` |
+| Modificación | `MODIFICAR:<idSol>:<idReserva>:<ocurrenciaNueva>:<cantidadNueva>` | `OK` o `RECHAZADO` |
+| Cancelación | `CANCELAR:<idSol>:<idReserva>:<ipCliente>:<puertoNotif>` | `ACEPTADA` de inmediato |
+| Notificación (después, al PULL del cliente) | — | `NOTIF:<idReserva>:CANCELADA` o `RECHAZADA` |
+| Interno: Cancelaciones → Persistencia | `LIBERAR:<idSol>:<idReserva>` | `OK` o `RECHAZADO` |
+
+Errores: `ERROR:<explicación>`.
+
+## 5. Base de datos SQLite (máquina 3, `datos/srb.db`)
+
+| Tabla | Contenido |
 |---|---|
-| `evento` | `id` (PK), `ocurrencias` |
-| `ocurrencia` | `evento_id` (FK), `numero`, `fecha`, `capacidad`, `disponibles` — `CHECK (disponibles BETWEEN 0 AND capacidad)` |
-| `transaccion` | `id`, `fecha_hora`, `operacion`, `detalle`, `resultado` (bitácora de operaciones) |
+| `evento` | id, ocurrencias |
+| `ocurrencia` | evento, número, fecha, capacidad, disponibles (`CHECK disponibles BETWEEN 0 AND capacidad`) |
+| `reserva` | id, evento, ocurrencia, cantidad, estado ACTIVA/CANCELADA |
+| `solicitud` | idSol, operación, respuesta (idempotencia) |
+| `transaccion` | bitácora de todas las operaciones |
 
-- **Primera ejecución o `--reiniciar`**: carga inicial del enunciado: 50 eventos (E1–E20 con dos ocurrencias,
-  E21–E50 con una), 100 asientos por ocurrencia.
-- **Ejecuciones siguientes**: continúa con los datos guardados. Si se reinicia la máquina 3, las reservas
-  confirmadas siguen ahí.
-- **Caso de prueba del profesor**: `--carga=caso.json` (mismo formato JSON que devuelve `CONSULTA`).
-- **Reserva atómica**: `UPDATE ocurrencia SET disponibles = disponibles - ? WHERE ... AND disponibles >= ?`
-  dentro de una transacción junto con el registro en `transaccion`. Si actualiza 1 fila, `OK`; si 0, `RECHAZADO`.
-  Nunca se sobrevende. Con `PRAGMA synchronous=FULL`, cada `COMMIT` queda escrito en disco antes de responder.
-
-### Ver la base de datos (en la máquina 3)
+Cada escritura es una transacción `BEGIN IMMEDIATE` con `synchronous=FULL`: se confirma en disco antes
+de responder. El descuento de asientos es un `UPDATE ... WHERE disponibles >= ?`, así que nunca se sobrevende.
 
 ```bash
-sudo apt install -y sqlite3          # una sola vez
-sqlite3 -header -column ~/datos/srb.db "SELECT * FROM ocurrencia WHERE evento_id='E1';"
-sqlite3 -header -column ~/datos/srb.db "SELECT evento_id, numero, capacidad-disponibles AS ocupados FROM ocurrencia WHERE disponibles < capacidad;"
+sudo apt install -y sqlite3
+sqlite3 -header -column ~/datos/srb.db "SELECT * FROM ocurrencia WHERE disponibles < capacidad;"
+sqlite3 -header -column ~/datos/srb.db "SELECT * FROM reserva ORDER BY id DESC LIMIT 10;"
 sqlite3 -header -column ~/datos/srb.db "SELECT * FROM transaccion ORDER BY id DESC LIMIT 10;"
 ```
-
-## 4. Protocolo de mensajes (texto UTF-8, un frame)
-
-| Solicitud | Respuesta |
-|---|---|
-| `CONSULTA` | JSON con los eventos: `{"E1":{"id":"E1","ocurrencias":2,...},...}` |
-| `RESERVA:<evento>:<ocurrencia>:<cantidad>` (p. ej. `RESERVA:E3:1:2`) | `OK` o `RECHAZADO` |
-| otro | `ERROR:...` |
-
-## 5. Patrones de comunicación
-
-- **Consulta y reserva → patrón síncrono Request/Reply (REQ/REP) de ZeroMQ.** El cliente envía con un socket
-  REQ y queda bloqueado hasta la respuesta. El GT (REP hacia clientes, REQ hacia el RMC) reenvía y espera; el
-  RMC (REP hacia el GT, REQ hacia la Persistencia) hace lo mismo. La respuesta solo sube cuando la Persistencia
-  ya guardó el cambio.
-- **Cancelación (segunda entrega) → patrón asíncrono** (PUSH/PULL o PUB/SUB): el GT acepta la cancelación sin
-  esperar a la Persistencia y el servicio de cancelaciones notifica al cliente después.
 
 ## 6. Pruebas de carga
 
 `pruebas.GeneradorCargaMain` simula los escenarios de la Tabla 1 (A = 3 clientes, B = 5, C = 8). Use
-`--ayuda` para ver los parámetros (`--rpm`, `--pct-reserva`, `--duracion`, ...). Los resultados (CSV y resumen
-con promedio, desviación estándar y TPM) quedan en `resultados/`.
+`--ayuda` para ver los parámetros (`--rpm`, `--pct-reserva`, `--duracion`, ...). Los resultados (CSV y
+resumen con promedio, desviación estándar y TPM) quedan en `resultados/`. Reinicie la Persistencia
+con `--reiniciar` entre pruebas independientes.

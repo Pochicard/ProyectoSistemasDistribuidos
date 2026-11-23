@@ -4,12 +4,12 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * Lectura de argumentos de línea de comandos con la forma {@code --clave=valor}.
+ * Lectura de argumentos de linea de comandos con la forma {@code --clave=valor}.
  *
- * <p>Existe para que NINGUNA dirección de red quede escrita en el código: cada servicio
- * recibe por argumento la IP y el puerto de la capa siguiente. Así el mismo .jar se
- * ejecuta en una sola máquina (todo en localhost) o en tres máquinas distintas
- * cambiando únicamente los argumentos.</p>
+ * <p>Existe para que NINGUNA direccion de red quede escrita en el codigo: cada servicio
+ * recibe por argumento la IP y el puerto de la capa siguiente. Asi el mismo .jar se
+ * ejecuta en una sola maquina (todo en localhost) o en tres maquinas distintas
+ * cambiando unicamente los argumentos.</p>
  *
  * <p>Orden de prioridad para cada valor: argumento {@code --clave=valor} &gt; variable de
  * entorno (p. ej. {@code SRB_RMC}) &gt; valor por defecto.</p>
@@ -50,12 +50,12 @@ public final class Argumentos {
         try {
             return Integer.parseInt(v);
         } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("--" + clave + " debe ser un número entero: " + v);
+            throw new IllegalArgumentException("--" + clave + " debe ser un numero entero: " + v);
         }
     }
 
     /**
-     * Lee una dirección {@code host:puerto} y devuelve el endpoint ZeroMQ {@code tcp://host:puerto}.
+     * Lee una direccion {@code host:puerto} y devuelve el endpoint ZeroMQ {@code tcp://host:puerto}.
      */
     public String endpoint(String clave, String defecto) {
         String v = texto(clave, defecto);
@@ -63,7 +63,7 @@ public final class Argumentos {
         if (dosPuntos <= 0 || dosPuntos == v.length() - 1) {
             throw new IllegalArgumentException("--" + clave + " debe tener la forma host:puerto, p. ej. 192.168.1.20:5556");
         }
-        Integer.parseInt(v.substring(dosPuntos + 1)); // valida que el puerto sea numérico
+        Integer.parseInt(v.substring(dosPuntos + 1)); // valida que el puerto sea numerico
         return "tcp://" + v;
     }
 }
